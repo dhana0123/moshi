@@ -10,6 +10,7 @@ The code has been adapted from Audiocraft, see LICENSE.audiocraft
 """
 
 # flake8: noqa
+from . import architecture
 from . import conditioners
 from . import models
 from . import modules

@@ -1,0 +1,45 @@
+# Default 7B Moshi (paper Table 1 / inference loaders).
+# Freeze Mimi; train Temporal (Helium) + Depformer. Override freeze to swap later.
+
+run_dir: runs/moshi_default
+overwrite_run_dir: false
+train_data: ""  # jsonl with {path, duration}; each wav needs a sibling .json alignments file
+shuffle: true
+
+hf_repo: kyutai/moshiko-pytorch-bf16
+init: pretrained  # pretrained | random
+
+freeze:
+  mimi: true
+  lm.temporal: false
+  lm.depformer: false
+
+first_codebook_weight_multiplier: 100.0
+text_padding_weight: 0.5
+keep_main_only: true
+audio_delay: 0.0
+text_mask_proba: 1.0
+
+duration_sec: 100
+batch_size: 1
+num_microbatches: 1
+max_steps: 100
+max_norm: 1.0
+gradient_checkpointing: true
+param_dtype: bfloat16
+seed: 0
+
+optim:
+  temporal_lr: 2.0e-6
+  depformer_lr: 2.0e-6
+  mimi_lr: 8.0e-4
+  weight_decay: 0.1
+  pct_start: 0.05
+
+log_freq: 1
+ckpt_freq: 50
+do_ckpt: true
+num_ckpt_keep: 3
+do_eval: false
+eval_data: ""
+eval_freq: 0

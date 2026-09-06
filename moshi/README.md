@@ -137,6 +137,37 @@ with torch.no_grad(), mimi.streaming(4):
     # The codes for those two should simply be discarded.
 ```
 
+## Training (research scaffold)
+
+The inference models are wrapped as `MoshiSystem` so you can freeze or swap
+components (Mimi encoder/quantizer, Temporal / Helium, Depformer) without
+changing the train loop.
+
+Install extras, then train from a YAML config (default 7B, Mimi frozen):
+
+```bash
+pip install -e ".[train]"
+python -m moshi.train --config moshi/train/configs/default_7b.yaml
+# or, after install:
+moshi-train --config path/to/default_7b.yaml
+```
+
+Set `train_data` to a jsonl of `{"path": "file.wav", "duration": ...}` rows.
+Each wav needs a sibling `.json` with Whisper-style `alignments`:
+`[word, [start_sec, end_sec], speaker]`. Use stereo files (left = Moshi,
+right = user). Loading uses the same `CheckpointInfo` / `get_mimi` /
+`get_moshi` path as the server.
+
+Example freeze / swap in code:
+
+```python
+from moshi.architecture import MoshiSystem
+
+system = MoshiSystem.from_pretrained(freeze={"mimi": True})
+system.freeze_components({"lm.temporal": True, "lm.depformer": False})
+# system.swap("lm.temporal", my_backbone)
+```
+
 ## Development
 
 If you wish to install from a clone of this repository, maybe to further develop Moshi, you can do the following:
