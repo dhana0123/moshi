@@ -189,6 +189,22 @@ Similarly, Moshi can be tested (with a GPU) with
 python scripts/moshi_benchmark.py
 ```
 
+### FullDuplexBench evaluation
+
+To score base Moshi on duplex categories (pause handling, backchannel, turn taking,
+user interruption), install the optional eval extra and see
+[`moshi/evaluate/README.md`](moshi/evaluate/README.md):
+
+```bash
+pip install -e '.[eval]'
+python -m moshi.evaluate.run_bench --bench-root /path/to/fullduplex_bench --results-root results/fullduplex
+python -m moshi.evaluate.evaluate --results-root results/fullduplex
+```
+
+Stock Moshiko/Moshika do not take PersonaPlex-style text prompts; generation is
+user audio in, Moshi audio + text out. User Interruption scoring needs
+`LLM_BASE_URL` and `LLM_API_KEY`.
+
 
 ## License
 

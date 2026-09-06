@@ -27,12 +27,15 @@ moshi-client-py = "moshi.client:main"
 moshi-inference = "moshi.run_inference:main"
 moshi-tts = "moshi.run_tts:main"
 moshi-train = "moshi.train.loop:main"
+moshi-eval = "moshi.evaluate.evaluate:main"
+moshi-eval-bench = "moshi.evaluate.run_bench:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "moshi.__version__"}
 
 [tool.setuptools.package-data]
 "moshi.train" = ["configs/*.yaml"]
+"moshi.evaluate.judge.assets" = ["*.json"]
 
 [build-system]
 requires = ["setuptools"]
@@ -48,6 +51,14 @@ dev = [
 ]
 train = [
     "pyyaml >= 6.0",
+]
+eval = [
+    "torchaudio",
+    "silero-vad",
+    "scipy",
+    "nemo_toolkit[asr]",
+    "openai",
+    "tqdm >= 4.48",
 ]
 
 # Ruff is not enforced atm, but if you want to use it on your code
