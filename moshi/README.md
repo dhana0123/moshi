@@ -189,6 +189,20 @@ Similarly, Moshi can be tested (with a GPU) with
 python scripts/moshi_benchmark.py
 ```
 
+### Train ETA bench
+
+Before a long finetune, measure sec/step on your GPU (warmup + short timed train),
+then project hours for 1k / 2k / 10k steps (and the config’s `max_steps`):
+
+```bash
+pip install -e '.[train]'
+python -m moshi.train.bench_eta --config path/to.yaml --warmup 5 --steps 50
+# or: moshi-train-eta --config path/to.yaml
+```
+
+Requires `train_data` in the YAML (same as a real train run). Checkpoints/eval are
+disabled for the bench; scratch dir defaults to `runs/eta_bench`.
+
 ### FullDuplexBench evaluation
 
 To score base Moshi on duplex categories (pause handling, backchannel, turn taking,

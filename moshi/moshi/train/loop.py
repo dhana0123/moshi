@@ -25,7 +25,7 @@ from .distributed import BACKEND, avg_aggregate, get_rank, get_world_size, is_to
 from .eval import evaluate
 from .loss import moshi_loss
 from .mixed_precision import downcast_mixed_precision, prepare_mixed_precision, upcast_mixed_precision
-from .utils import TrainState, set_random_seed
+from .utils import TrainState, format_eta, set_random_seed
 from .wrapped_model import build_param_groups, maybe_fsdp
 
 logger = logging.getLogger("moshi.train")
@@ -36,15 +36,19 @@ def main_logger_info(message: str) -> None:
         logger.info(message)
 
 
-def train(config: str) -> None:
+def train(config: str) -> TrainState:
     args = TrainArgs.load(config)
+    return train_from_args(args)
+
+
+def train_from_args(args: TrainArgs) -> TrainState:
     if not args.train_data:
         raise SystemExit("Set train_data in the YAML to a jsonl (or directory of jsonl files).")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     set_random_seed(args.seed)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    if is_torchrun():
+    if is_torchrun() and not (dist.is_available() and dist.is_initialized()):
         set_device()
         dist.init_process_group(backend=BACKEND)
 
@@ -181,16 +185,22 @@ def train(config: str) -> None:
         downcast_mixed_precision(lm.parameters(), param_dtype=param_dtype)
         scheduler.step()
         avg_loss = avg_aggregate(loss.item()) if torch.cuda.is_available() and dist.is_initialized() else loss.item()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         state.end_step(n_tokens)
         if state.step % args.log_freq == 0 and get_rank() == 0:
+            eta = state.eta_seconds()
+            eta_str = format_eta(eta) if eta is not None else "n/a"
             logger.info(
-                "step %s/%s loss=%.4f text=%.4f audio=%.4f lr=%s",
+                "step %s/%s loss=%.4f text=%.4f audio=%.4f lr=%s ms/step=%.0f eta=%s",
                 state.step,
                 args.max_steps,
                 avg_loss,
                 float(text_loss.detach()),
                 float(audio_loss.detach()),
                 scheduler.get_last_lr(),
+                state.this_step_time * 1000.0,
+                eta_str,
             )
         if args.do_eval and eval_loader is not None and args.eval_freq > 0 and (
             state.step % args.eval_freq == 0 or is_last
@@ -200,6 +210,7 @@ def train(config: str) -> None:
             checkpointer.save_checkpoint(dtype=param_dtype)
 
     main_logger_info("done")
+    return state
 
 
 def packaged_config() -> Path:
