@@ -10,10 +10,12 @@
 
 import logging
 import typing as tp
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from functools import partial
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -23,6 +25,13 @@ from ..modules.transformer import StreamingTransformer, create_norm_fn
 from ..utils.compile import CUDAGraphed
 from ..utils.quantize import replace_linear_with_qlinear
 from ..utils.sampling import sample_token
+from .hybrid_prompt import (
+    SILENCE_TOKENS,
+    SINE_TOKENS,
+    encode_wav_agent_codes,
+    iter_code_frames,
+    silence_frame_count,
+)
 from .lm_utils import ScaledEmbedding, _delay_sequence, _init_layer, _undelay_sequence
 
 logger = logging.getLogger(__name__)
@@ -34,6 +43,11 @@ def scatter_with_mask_(tensor: torch.Tensor, dim: int,
     old_value = tensor.gather(dim, index)
     value = torch.where(mask, value, old_value)
     tensor.scatter_(dim, index, value)
+
+
+def _codes_view(src: np.ndarray, n: int, device: torch.device) -> torch.Tensor:
+    vals = src[:n] if n <= len(src) else np.resize(src, n)
+    return torch.as_tensor(vals, dtype=torch.long, device=device).view(1, n, 1)
 
 
 @dataclass
@@ -571,6 +585,10 @@ class LMGen(StreamingModule[_LMGenState]):
         support_out_of_sync: bool = False,
         cfg_is_masked_until: list[int] | None = None,
         cfg_is_no_text: bool = False,
+        audio_silence_frame_cnt: int | None = None,
+        text_prompt_tokens: list[int] | None = None,
+        sample_rate: int = 24000,
+        frame_rate: float = 12.5,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -597,6 +615,19 @@ class LMGen(StreamingModule[_LMGenState]):
         self.support_out_of_sync = support_out_of_sync
         self.cfg_is_masked_until = cfg_is_masked_until
         self.cfg_is_no_text = cfg_is_no_text
+        self.text_prompt_tokens: list[int] | None = text_prompt_tokens
+        self.audio_silence_frame_cnt = (
+            audio_silence_frame_cnt
+            if audio_silence_frame_cnt is not None
+            else silence_frame_count(frame_rate)
+        )
+        self.zero_text_code = lm_model.text_padding_token_id
+        self._sample_rate = sample_rate
+        self._frame_rate = frame_rate
+        self._frame_size = int(self._sample_rate / self._frame_rate)
+        self.voice_prompt: str | None = None
+        self.voice_prompt_audio: np.ndarray | None = None
+        self.voice_prompt_codes: torch.Tensor | None = None
         if self.cfg_coef != 1.:
             if not self.cfg_is_no_text and not self.cfg_is_masked_until:
                 assert self.lm_model.fuser is not None, "Model has no fuser, cannot do CFG."
@@ -667,7 +698,9 @@ class LMGen(StreamingModule[_LMGenState]):
 
     @torch.no_grad()
     def _step(self, input_tokens: torch.Tensor,
-              depformer_replace_tokens: torch.Tensor | None = None
+              depformer_replace_tokens: torch.Tensor | None = None,
+              moshi_tokens: torch.Tensor | None = None,
+              text_token: torch.Tensor | int | None = None,
               ) -> tuple[torch.Tensor, torch.Tensor] | None:
         state = self._streaming_state
         if state is None:
@@ -687,6 +720,29 @@ class LMGen(StreamingModule[_LMGenState]):
 
         if Ki > needed_tokens:
             input_tokens = input_tokens[:, :needed_tokens, :]
+
+        text_token_forced: torch.Tensor | None = None
+        if text_token is not None:
+            if not torch.is_tensor(text_token):
+                text_token_forced = torch.full(
+                    (B,), int(text_token), dtype=torch.long, device=lm_model.device
+                )
+            else:
+                text_token_forced = text_token.to(device=lm_model.device, dtype=torch.long)
+                if text_token_forced.dim() == 0:
+                    text_token_forced = text_token_forced.expand(B)
+                elif text_token_forced.dim() > 1:
+                    text_token_forced = text_token_forced.reshape(B)
+            assert text_token_forced.shape == (B,), text_token_forced.shape
+
+        if moshi_tokens is not None:
+            assert moshi_tokens.dim() == 3, "moshi_tokens shape should be [B, dep_q, 1]."
+            if moshi_tokens.shape[0] == 1 and B > 1:
+                moshi_tokens = moshi_tokens.expand(B, -1, -1)
+            if moshi_tokens.shape[1] > lm_model.dep_q:
+                moshi_tokens = moshi_tokens[:, : lm_model.dep_q]
+            assert moshi_tokens.shape[0] == B
+            assert moshi_tokens.shape[2] == 1
 
         CT = state.cache.shape[2]
 
@@ -745,10 +801,17 @@ class LMGen(StreamingModule[_LMGenState]):
         text_token = text_token[:, 0, 0]  # shape is [B]
         if self.on_text_hook is not None:
             self.on_text_hook(text_token)
+        if text_token_forced is not None:
+            text_token = text_token_forced
         if state.graphed_depth is None:
             audio_tokens = None
         else:
-            if depformer_replace_tokens is None:
+            if moshi_tokens is not None:
+                audio_tokens = moshi_tokens.squeeze(-1)
+                assert audio_tokens.shape[-1] == lm_model.dep_q, (
+                    audio_tokens.shape, lm_model.dep_q
+                )
+            elif depformer_replace_tokens is None:
                 audio_tokens = state.graphed_depth(text_token, transformer_out)
             else:
                 assert depformer_replace_tokens.dim() == 3
@@ -784,8 +847,15 @@ class LMGen(StreamingModule[_LMGenState]):
 
     @torch.no_grad()
     def step(self, input_tokens: torch.Tensor,
-             depformer_replace_tokens: torch.Tensor | None = None) -> torch.Tensor | None:
-        out = self._step(input_tokens, depformer_replace_tokens)
+             depformer_replace_tokens: torch.Tensor | None = None,
+             moshi_tokens: torch.Tensor | None = None,
+             text_token: torch.Tensor | int | None = None) -> torch.Tensor | None:
+        out = self._step(
+            input_tokens,
+            depformer_replace_tokens,
+            moshi_tokens=moshi_tokens,
+            text_token=text_token,
+        )
         if out is None:
             return None
         return out[0]
@@ -795,8 +865,15 @@ class LMGen(StreamingModule[_LMGenState]):
         self,
         input_tokens: torch.Tensor,
         depformer_replace_tokens: torch.Tensor | None = None,
+        moshi_tokens: torch.Tensor | None = None,
+        text_token: torch.Tensor | int | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
-        out = self._step(input_tokens, depformer_replace_tokens)
+        out = self._step(
+            input_tokens,
+            depformer_replace_tokens,
+            moshi_tokens=moshi_tokens,
+            text_token=text_token,
+        )
         if out is None:
             return None
         out, transformer_out = out
@@ -805,6 +882,143 @@ class LMGen(StreamingModule[_LMGenState]):
             for extra_head in self.lm_model.extra_heads
         ]
         return out, extra_heads
+
+    @property
+    def has_hybrid_prompt(self) -> bool:
+        has_voice = self.voice_prompt_codes is not None or self.voice_prompt_audio is not None
+        has_text = bool(self.text_prompt_tokens)
+        return has_voice or has_text
+
+    def _user_q(self) -> int:
+        return self.lm_model.num_codebooks - self.lm_model.dep_q - 1
+
+    def _batch_size(self) -> int:
+        state = self._streaming_state
+        return 1 if state is None else int(state.batch_size)
+
+    def _repeat_frame(self, frame: torch.Tensor) -> torch.Tensor:
+        b = self._batch_size()
+        if frame.shape[0] == 1 and b > 1:
+            return frame.expand(b, -1, -1).contiguous()
+        return frame
+
+    def _encode_zero_frame(self) -> torch.Tensor:
+        dq = self.lm_model.dep_q
+        tokens = _codes_view(SILENCE_TOKENS, dq, self.lm_model.device)
+        return self._repeat_frame(tokens)
+
+    def _encode_sine_frame(self) -> torch.Tensor:
+        uq = self._user_q()
+        if uq == 0:
+            b = self._batch_size()
+            return torch.zeros(b, 0, 1, dtype=torch.long, device=self.lm_model.device)
+        tokens = _codes_view(SINE_TOKENS, uq, self.lm_model.device)
+        return self._repeat_frame(tokens)
+
+    def load_voice_prompt(self, voice_prompt: str) -> None:
+        self.voice_prompt = voice_prompt
+        self.voice_prompt_codes = None
+        try:
+            import sphn
+        except ImportError as exc:
+            raise ImportError("sphn is required to load a voice-prompt wav.") from exc
+        wav, _ = sphn.read(voice_prompt, sample_rate=self._sample_rate)
+        if wav.ndim == 1:
+            wav = wav[None, :]
+        self.voice_prompt_audio = np.asarray(wav[:1], dtype=np.float32)
+
+    def load_voice_prompt_codes(self, path: str) -> None:
+        self.voice_prompt = path
+        self.voice_prompt_audio = None
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu")
+        codes = payload["codes"] if isinstance(payload, dict) and "codes" in payload else payload
+        if not torch.is_tensor(codes):
+            raise ValueError(f"No 'codes' tensor in voice prompt {path}")
+        if codes.dim() == 3:
+            codes = codes[0]
+        self.voice_prompt_codes = codes.to(dtype=torch.long)
+
+    def load_voice_prompt_path(self, path: str) -> None:
+        if path.endswith(".pt"):
+            try:
+                self.load_voice_prompt_codes(path)
+            except (KeyError, ValueError, RuntimeError):
+                logger.warning(
+                    "Voice prompt %s is not a codes tensor; expected wav or .pt with 'codes'. Skipping voice.",
+                    path,
+                )
+                self.voice_prompt = path
+                self.voice_prompt_audio = None
+                self.voice_prompt_codes = None
+        else:
+            self.load_voice_prompt(path)
+
+    def _voice_code_frames(self, mimi) -> Iterator[torch.Tensor]:
+        if self.voice_prompt_codes is not None:
+            codes = self.voice_prompt_codes.to(self.lm_model.device)
+            yield from iter_code_frames(codes)
+            return
+        if self.voice_prompt_audio is None:
+            return
+        codes = encode_wav_agent_codes(mimi, self.voice_prompt_audio)
+        yield from iter_code_frames(codes)
+
+    def _step_voice_prompt(self, mimi) -> None:
+        for frame in self._voice_code_frames(mimi):
+            self.step(
+                input_tokens=self._encode_sine_frame(),
+                moshi_tokens=self._repeat_frame(frame[:, : self.lm_model.dep_q]),
+                text_token=self.zero_text_code,
+            )
+
+    def _step_audio_silence(self) -> None:
+        for _ in range(self.audio_silence_frame_cnt):
+            self.step(
+                input_tokens=self._encode_sine_frame(),
+                moshi_tokens=self._encode_zero_frame(),
+                text_token=self.zero_text_code,
+            )
+
+    def _step_text_prompt(self) -> None:
+        if not self.text_prompt_tokens:
+            return
+        for tok in self.text_prompt_tokens:
+            self.step(
+                input_tokens=self._encode_sine_frame(),
+                moshi_tokens=self._encode_zero_frame(),
+                text_token=int(tok),
+            )
+
+    async def step_system_prompts_async(self, mimi, is_alive: Callable | None = None) -> None:
+        self._step_voice_prompt(mimi)
+        if is_alive is not None and not await is_alive():
+            return
+        self._step_audio_silence()
+        if is_alive is not None and not await is_alive():
+            return
+        self._step_text_prompt()
+        if is_alive is not None and not await is_alive():
+            return
+        self._step_audio_silence()
+
+    def step_system_prompts(self, mimi) -> None:
+        """Force-feed Hybrid System Prompt: voice, silence, role text, silence."""
+        if not self.has_hybrid_prompt:
+            return
+        self._step_voice_prompt(mimi)
+        self._step_audio_silence()
+        self._step_text_prompt()
+        self._step_audio_silence()
+
+    def reset_generation_state(self) -> None:
+        self.reset_streaming()
+        state = self._streaming_state
+        if state is not None:
+            state.cache.fill_(self.lm_model.ungenerated_token_id)
+            state.offset_cpu = 0
 
     def depformer_step(
         self,

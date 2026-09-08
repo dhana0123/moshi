@@ -19,6 +19,12 @@ text_padding_weight: 0.5
 keep_main_only: true
 audio_delay: 0.0
 text_mask_proba: 1.0
+hybrid_prompt: false
+audio_silence_seconds: 0.5
+voice_prompt_dir: null
+system_prompts:
+  - "You enjoy having a good conversation."
+hybrid_prompt_proba: 1.0
 
 duration_sec: 100
 batch_size: 1

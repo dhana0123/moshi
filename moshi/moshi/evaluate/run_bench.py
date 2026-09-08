@@ -4,12 +4,14 @@
 """
 Generate Moshi outputs for FullDuplexBench categories.
 
-Walks ``--bench-root/<dataset>/*.wav``, runs streaming Moshi inference, and
-writes ``--results-root/<dataset>/<id>.wav`` plus a sidecar JSON for scoring.
+Walks ``--bench-root/<dataset>/*.wav``, runs streaming Moshi inference with the
+PersonaPlex Hybrid System Prompt (voice + text system prompt), and writes
+``--results-root/<dataset>/<id>.wav`` plus a sidecar JSON for scoring.
 
-Stock Moshiko/Moshika have no text system-prompt conditioner, so PersonaPlex-style
-prompts are not applied. Input is user audio only; output is Moshi audio +
-inner-monologue text tokens.
+Text prompts follow the PersonaPlex FullDuplexBench guidance:
+
+- Pause / Backchannel / Turn taking: ``You enjoy having a good conversation.``
+- User Interruption: wise-and-friendly-teacher assistant prompt
 
 Expected bench layout (user-supplied FullDuplexBench dump, not in git)::
 
@@ -49,6 +51,20 @@ DATASET_NAMES = [
 METADATA_DATASETS = {
     "candor_turn_taking",
     "synthetic_user_interruption",
+}
+
+PROMPT_CONVERSATION = "You enjoy having a good conversation."
+PROMPT_INTERRUPTION = (
+    "You are a wise and friendly teacher. Answer questions or provide advice "
+    "in a clear and engaging way."
+)
+
+DATASET_TEXT_PROMPT = {
+    "synthetic_pause_handling": PROMPT_CONVERSATION,
+    "candor_pause_handling": PROMPT_CONVERSATION,
+    "icc_backchannel": PROMPT_CONVERSATION,
+    "candor_turn_taking": PROMPT_CONVERSATION,
+    "synthetic_user_interruption": PROMPT_INTERRUPTION,
 }
 
 
@@ -94,6 +110,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg-coef", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=4242)
     parser.add_argument(
+        "--text-prompt",
+        type=str,
+        default=None,
+        help="Override dataset Hybrid System Prompt role text.",
+    )
+    parser.add_argument(
+        "--voice-prompt",
+        type=str,
+        default="",
+        help="Voice wav or .pt codes filename (joined with --voice-prompt-dir).",
+    )
+    parser.add_argument(
+        "--voice-prompt-dir",
+        type=str,
+        default=None,
+        help="Directory containing voice prompts.",
+    )
+    parser.add_argument(
         "--skip-existing",
         action="store_true",
         help="Skip samples that already have a results json.",
@@ -130,31 +164,21 @@ def _text_tokens_to_pieces(
     return pieces
 
 
-def _reset_state(state: InferenceState) -> None:
-    state.mimi.reset_streaming()
-    state.lm_gen.reset_streaming()
-    # LMGen.reset clears offsets but leaves the delay cache; wipe it so samples
-    # do not leak tokens into the next file.
-    gen_state = state.lm_gen._streaming_state
-    if gen_state is not None and hasattr(gen_state, "cache"):
-        gen_state.cache.fill_(state.lm_gen.lm_model.ungenerated_token_id)
-        gen_state.offset_cpu = 0
-
-
 def run_one(
     state: InferenceState,
     wav_path: Path,
     out_wav: Path,
     out_json: Path,
     input_path: Path | None,
+    text_prompt: str = "",
+    voice_path: str | None = None,
 ) -> None:
-    _reset_state(state)
     in_pcms, _ = sphn.read(str(wav_path), sample_rate=state.mimi.sample_rate)
     in_pcms = torch.from_numpy(in_pcms).to(device=state.device)
     # Mono, batch size 1.
     in_pcms = in_pcms[None, 0:1]
 
-    out_items = state.run(in_pcms)
+    out_items = state.run(in_pcms, text_prompt=text_prompt, voice_path=voice_path)
     if not out_items:
         raise RuntimeError(f"No output generated for {wav_path}")
 
@@ -208,6 +232,12 @@ def main() -> None:
         **checkpoint_info.lm_gen_config,
     )
 
+    voice_path = args.voice_prompt or None
+    if voice_path and args.voice_prompt_dir:
+        voice_path = str(Path(args.voice_prompt_dir) / args.voice_prompt)
+        if not Path(voice_path).exists():
+            raise FileNotFoundError(f"Voice prompt not found: {voice_path}")
+
     for dataset in datasets:
         if dataset not in DATASET_NAMES:
             log("warning", f"Unknown dataset {dataset}, skipping")
@@ -220,7 +250,8 @@ def main() -> None:
         dst_dir.mkdir(parents=True, exist_ok=True)
 
         wavs = sorted(src_dir.rglob("*.wav"))
-        log("info", f"{dataset}: {len(wavs)} wav files")
+        text_prompt = args.text_prompt or DATASET_TEXT_PROMPT.get(dataset, PROMPT_CONVERSATION)
+        log("info", f"{dataset}: {len(wavs)} wav files; prompt={text_prompt!r}")
         for wav_path in wavs:
             rel = wav_path.relative_to(src_dir)
             out_stem = dst_dir / rel.with_suffix("")
@@ -244,7 +275,15 @@ def main() -> None:
             try:
                 log("info", f"Running {wav_path.name}")
                 with torch.no_grad():
-                    run_one(state, wav_path, out_wav, out_json, meta)
+                    run_one(
+                        state,
+                        wav_path,
+                        out_wav,
+                        out_json,
+                        meta,
+                        text_prompt=text_prompt,
+                        voice_path=voice_path,
+                    )
             except Exception as err:
                 logger.exception("Failed on %s: %s", wav_path, err)
 

@@ -11,9 +11,18 @@ Self-contained duplex eval for base Moshi (Moshiko / Moshika). Scores the five
 | Smooth Turn Taking | `candor_turn_taking` | `TO`, `latency` |
 | User Interruption | `synthetic_user_interruption` | `TO`, `latency`, LLM `score` 0–5 |
 
-Stock Moshi has **no text system-prompt conditioner**, so PersonaPlex-style role
-prompts are not applied. Generation is user wav in → Moshi audio + inner-monologue
-text out.
+Moshi now applies a PersonaPlex-style **Hybrid System Prompt** before each
+sample: optional voice clip on agent audio + role text on the agent text
+stream (`<system> … <system>`), with 440 Hz sine on the user stream and short
+silence delimiters. Vanilla Moshiko/Moshika checkpoints were not trained on
+this prefix; use a finetune (`hybrid_prompt: true`) or compatible weights.
+
+Default role text:
+
+- Pause / backchannel / turn-taking: `You enjoy having a good conversation.`
+- User interruption: wise-and-friendly-teacher prompt
+
+Pass `--voice-prompt` / `--voice-prompt-dir` and optional `--text-prompt`.
 
 The FullDuplexBench audio/metadata dump is **not** shipped in this repo. Obtain it
 from the FullDuplexBench release and lay it out as:

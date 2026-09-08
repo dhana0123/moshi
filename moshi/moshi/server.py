@@ -22,6 +22,7 @@ import sphn
 import torch
 from .client_utils import log
 from .models import loaders, MimiModel, LMModel, LMGen
+from .models.hybrid_prompt import wrap_with_system_tags
 from .run_inference import get_condition_tensors
 
 
@@ -45,16 +46,30 @@ class ServerState:
     lock: asyncio.Lock
 
     def __init__(self, model_type: str, mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
-                 lm: LMModel, cfg_coef: float, device: str | torch.device, **kwargs):
+                 lm: LMModel, cfg_coef: float, device: str | torch.device,
+                 voice_prompt_dir: str | None = None,
+                 default_text_prompt: str = "",
+                 default_voice_prompt: str = "",
+                 **kwargs):
         self.model_type = model_type
         self.mimi = mimi
         self.text_tokenizer = text_tokenizer
         condition_tensors = get_condition_tensors(model_type, lm, batch_size=1, cfg_coef=cfg_coef)
-        self.lm_gen = LMGen(lm, cfg_coef=cfg_coef, condition_tensors=condition_tensors, **kwargs)
+        self.lm_gen = LMGen(
+            lm,
+            cfg_coef=cfg_coef,
+            condition_tensors=condition_tensors,
+            sample_rate=int(mimi.sample_rate),
+            frame_rate=float(mimi.frame_rate),
+            **kwargs,
+        )
 
         self.device = device
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lock = asyncio.Lock()
+        self.voice_prompt_dir = voice_prompt_dir
+        self.default_text_prompt = default_text_prompt
+        self.default_voice_prompt = default_voice_prompt
 
         self.mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
@@ -70,6 +85,28 @@ class ServerState:
                 _ = self.mimi.decode(tokens[:, 1:])
 
         torch.cuda.synchronize()
+
+    def _resolve_voice_path(self, filename: str | None) -> str | None:
+        if not filename:
+            return None
+        if self.voice_prompt_dir:
+            return os.path.join(self.voice_prompt_dir, filename)
+        return filename
+
+    def apply_hybrid_prompt(self, text_prompt: str, voice_filename: str | None) -> None:
+        if text_prompt:
+            self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(
+                wrap_with_system_tags(text_prompt)
+            )
+        else:
+            self.lm_gen.text_prompt_tokens = None
+        voice_path = self._resolve_voice_path(voice_filename)
+        if voice_path:
+            self.lm_gen.load_voice_prompt_path(voice_path)
+        else:
+            self.lm_gen.voice_prompt = None
+            self.lm_gen.voice_prompt_audio = None
+            self.lm_gen.voice_prompt_codes = None
 
     async def decode_and_send(
         self,
@@ -160,8 +197,15 @@ class ServerState:
         async with self.lock:
             opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
+            text_prompt = request.query.get("text_prompt", self.default_text_prompt) or ""
+            voice_prompt = request.query.get("voice_prompt", self.default_voice_prompt) or ""
+            self.lm_gen.reset_generation_state()
             self.mimi.reset_streaming()
-            self.lm_gen.reset_streaming()
+            self.apply_hybrid_prompt(text_prompt, voice_prompt)
+            if self.lm_gen.has_hybrid_prompt:
+                log("info", f"hybrid prompt text={text_prompt!r} voice={voice_prompt!r}")
+                self.lm_gen.step_system_prompts(self.mimi)
+                self.mimi.reset_streaming()
             # Send the handshake.
             await ws.send_bytes(b"\x00")
             await self.recv_loop(ws, opus_reader, opus_writer)
@@ -187,6 +231,9 @@ def main():
     parser.add_argument("--lora-weight", type=str, help="Path to a local checkpoint file for LoRA.", default=None)
     parser.add_argument("--config-path", type=str, help="Path to a local config file.", default=None)
     parser.add_argument("--cfg-coef", type=float, default=1., help="CFG coefficient.")
+    parser.add_argument("--text-prompt", type=str, default="", help="Default Hybrid System Prompt role text.")
+    parser.add_argument("--voice-prompt", type=str, default="", help="Default voice prompt filename.")
+    parser.add_argument("--voice-prompt-dir", type=str, default=None, help="Directory of voice prompts.")
     parser.add_argument("--device", type=str, default="cuda", help="Device on which to run, defaults to 'cuda'.")
     parser.add_argument("--no_fuse_lora", action="store_false", dest="fuse_lora", default=True,
                         help="Do not fuse LoRA layers intot Linear layers.")
@@ -233,8 +280,13 @@ def main():
     lm = checkpoint_info.get_moshi(device=args.device, dtype=args.dtype, fuse_lora=args.fuse_lora)
     log("info", "moshi loaded")
 
-    state = ServerState(checkpoint_info.model_type, mimi, text_tokenizer, lm, args.cfg_coef, args.device,
-                        **checkpoint_info.lm_gen_config)
+    state = ServerState(
+        checkpoint_info.model_type, mimi, text_tokenizer, lm, args.cfg_coef, args.device,
+        voice_prompt_dir=args.voice_prompt_dir,
+        default_text_prompt=args.text_prompt,
+        default_voice_prompt=args.voice_prompt,
+        **checkpoint_info.lm_gen_config,
+    )
     log("info", "warming up the model")
     state.warmup()
     app = web.Application()

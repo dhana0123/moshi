@@ -137,3 +137,63 @@ def test_inner_monologue_epad():
     assert 0 in tokens  # EPAD
     assert 11 in tokens  # word piece
     assert 3 in tokens  # PAD
+
+
+def test_wrap_with_system_tags():
+    from moshi.models.hybrid_prompt import wrap_with_system_tags
+
+    assert wrap_with_system_tags("hello") == "<system> hello <system>"
+    tagged = "<system> already <system>"
+    assert wrap_with_system_tags(tagged) == tagged
+
+
+def test_hybrid_prefix_layout():
+    from moshi.models.hybrid_prompt import (
+        SILENCE_TOKENS,
+        SINE_TOKENS,
+        apply_prefix_loss_mask,
+        build_hybrid_system_prefix,
+    )
+
+    voice = torch.arange(8 * 3).view(8, 3)
+    prefix = build_hybrid_system_prefix(
+        [11, 12],
+        n_q=16,
+        dep_q=8,
+        pad_id=3,
+        silence_frames=2,
+        voice_codes=voice,
+    )
+    # voice 3 + sil 2 + text 2 + sil 2
+    assert prefix.shape == (1, 17, 9)
+    assert (prefix[0, 0, :3] == 3).all()
+    assert torch.equal(prefix[0, 1:9, :3], voice)
+    sine = torch.as_tensor(SINE_TOKENS, dtype=torch.long)
+    assert torch.equal(prefix[0, 9:, :3], sine.view(8, 1).expand(8, 3))
+    assert (prefix[0, 0, 5:7] == torch.tensor([11, 12])).all()
+    sil = torch.as_tensor(SILENCE_TOKENS, dtype=torch.long)
+    assert torch.equal(prefix[0, 1:9, 5:7], sil.view(8, 1).expand(8, 2))
+
+    text_mask = torch.ones(2, 1, 5, dtype=torch.bool)
+    audio_mask = torch.ones(2, 3, 5, dtype=torch.bool)
+    tmask, amask = apply_prefix_loss_mask(text_mask, audio_mask, torch.tensor([2, 0]))
+    assert tmask[0, 0, :2].sum() == 0
+    assert tmask[0, 0, 2:].all()
+    assert tmask[1].all()
+    assert amask[0, :, :2].sum() == 0
+
+
+@torch.no_grad()
+def test_lmgen_forced_hybrid_step():
+    model = _tiny_lm()
+    model.eval()
+    gen = lm_mod.LMGen(model, use_sampling=False, temp=1.0, temp_text=1.0)
+    user = torch.zeros(1, 0, 1, dtype=torch.long)
+    moshi = torch.zeros(1, 3, 1, dtype=torch.long)
+    with gen.streaming(1):
+        for _ in range(4):
+            gen.step(user, moshi_tokens=moshi, text_token=3)
+        state = gen._streaming_state
+        assert state is not None
+        assert int(state.offset_cpu) >= 4
+

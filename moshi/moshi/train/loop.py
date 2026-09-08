@@ -24,6 +24,7 @@ from .data.interleaver import InterleavedTokenizer, Interleaver
 from .distributed import BACKEND, avg_aggregate, get_rank, get_world_size, is_torchrun, set_device
 from .eval import evaluate
 from .loss import moshi_loss
+from ..models.hybrid_prompt import HybridPromptConfig, apply_prefix_loss_mask
 from .mixed_precision import downcast_mixed_precision, prepare_mixed_precision, upcast_mixed_precision
 from .utils import TrainState, format_eta, set_random_seed
 from .wrapped_model import build_param_groups, maybe_fsdp
@@ -101,7 +102,21 @@ def train_from_args(args: TrainArgs) -> TrainState:
         proba=args.text_mask_proba,
         device=device,
     )
-    interleaved = InterleavedTokenizer(system.mimi, interleaver, duration_sec=args.duration_sec)
+    interleaved = InterleavedTokenizer(
+        system.mimi,
+        interleaver,
+        duration_sec=args.duration_sec,
+        hybrid=HybridPromptConfig(
+            enabled=args.hybrid_prompt,
+            silence_seconds=args.audio_silence_seconds,
+            voice_prompt_dir=args.voice_prompt_dir,
+            system_prompts=args.system_prompts,
+            proba=args.hybrid_prompt_proba,
+            pad_id=lm.text_padding_token_id,
+        ),
+        n_q=lm.n_q,
+        dep_q=lm.dep_q,
+    )
     data_loader = build_data_loader(
         interleaved,
         train_data=args.train_data,
@@ -158,20 +173,25 @@ def train_from_args(args: TrainArgs) -> TrainState:
             if batch.condition_attributes is not None and getattr(lm, "condition_provider", None) is not None:
                 condition_tensors = lm.condition_provider.prepare(batch.condition_attributes)
             output = lm(codes=codes, condition_tensors=condition_tensors)
+            text_mask, audio_mask = output.text_mask, output.mask
+            if batch.prefix_frames is not None and int(batch.prefix_frames.max()) > 0:
+                text_mask, audio_mask = apply_prefix_loss_mask(
+                    text_mask, audio_mask, batch.prefix_frames.to(device)
+                )
             mb_loss, text_loss, audio_loss = moshi_loss(
                 output.text_logits,
                 codes[:, : lm.audio_offset],
-                output.text_mask,
+                text_mask,
                 output.logits,
                 codes[:, lm.audio_offset : lm.audio_offset + lm.dep_q],
-                output.mask,
+                audio_mask,
                 text_padding_ids={lm.text_padding_token_id, lm.end_of_text_padding_id},
                 first_codebook_weight_multiplier=args.first_codebook_weight_multiplier,
                 text_padding_weight=args.text_padding_weight,
             )
             mb_loss.backward()
             loss = loss + mb_loss.detach()
-            n_tokens += int(output.text_mask.numel() + output.mask.numel())
+            n_tokens += int(text_mask.numel() + audio_mask.numel())
             if i < args.num_microbatches - 1 and torch.cuda.is_available():
                 torch.cuda.synchronize()
         if args.num_microbatches > 1:

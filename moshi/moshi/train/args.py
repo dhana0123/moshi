@@ -56,6 +56,11 @@ class TrainArgs:
     audio_delay: float = 0.0
     keep_main_only: bool = True
     text_mask_proba: float = 1.0
+    hybrid_prompt: bool = False
+    audio_silence_seconds: float = 0.5
+    voice_prompt_dir: str | None = None
+    system_prompts: list[str] = field(default_factory=lambda: ["You enjoy having a good conversation."])
+    hybrid_prompt_proba: float = 1.0
     optim: OptimArgs = field(default_factory=OptimArgs)
 
     @classmethod
@@ -75,6 +80,10 @@ class TrainArgs:
                 k: v for k, v in kwargs["optim"].items()
                 if k in {f.name for f in fields(OptimArgs)}
             })
+        if isinstance(kwargs.get("system_prompts"), str):
+            kwargs["system_prompts"] = [kwargs["system_prompts"]]
+        if kwargs.get("voice_prompt_dir") == "":
+            kwargs["voice_prompt_dir"] = None
         return cls(**kwargs)
 
 

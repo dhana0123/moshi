@@ -18,6 +18,7 @@ import torch
 from .client_utils import AnyPrinter, Printer, RawPrinter, log
 from .conditioners import ConditionAttributes, ConditionTensors
 from .models import LMGen, LMModel, MimiModel, loaders
+from .models.hybrid_prompt import wrap_with_system_tags
 
 
 def seed_all(seed):
@@ -81,7 +82,12 @@ class InferenceState:
         self.text_tokenizer = text_tokenizer
         condition_tensors = get_condition_tensors(model_type, lm, batch_size, cfg_coef)
         self.lm_gen = LMGen(
-            lm, cfg_coef=cfg_coef, condition_tensors=condition_tensors, **kwargs
+            lm,
+            cfg_coef=cfg_coef,
+            condition_tensors=condition_tensors,
+            sample_rate=int(mimi.sample_rate),
+            frame_rate=float(mimi.frame_rate),
+            **kwargs,
         )
         self.device = device
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
@@ -94,7 +100,26 @@ class InferenceState:
         else:
             self.printer = RawPrinter()
 
-    def run(self, in_pcms: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    def apply_hybrid_prompt(self, text_prompt: str = "", voice_path: str | None = None) -> None:
+        if text_prompt:
+            self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(
+                wrap_with_system_tags(text_prompt)
+            )
+        else:
+            self.lm_gen.text_prompt_tokens = None
+        if voice_path:
+            self.lm_gen.load_voice_prompt_path(voice_path)
+        else:
+            self.lm_gen.voice_prompt = None
+            self.lm_gen.voice_prompt_audio = None
+            self.lm_gen.voice_prompt_codes = None
+
+    def run(
+        self,
+        in_pcms: torch.Tensor,
+        text_prompt: str = "",
+        voice_path: str | None = None,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Returns a list of tupel `(text_tokens, audio_tokens)`"""
         out_pcms_per_item: list[list[torch.Tensor]] = [
             [] for _ in range(self.batch_size)
@@ -135,6 +160,14 @@ class InferenceState:
         )
 
         self.printer.print_header()
+        self.lm_gen.reset_generation_state()
+        self.mimi.reset_streaming()
+        self.apply_hybrid_prompt(text_prompt, voice_path)
+        if self.lm_gen.has_hybrid_prompt:
+            self.printer.log("info", "applying hybrid system prompt (voice + role text)")
+            self.lm_gen.step_system_prompts(self.mimi)
+            self.mimi.reset_streaming()
+            first_frame = False
         while not all(eos_reached):
             if chunks:
                 chunk = chunks.popleft()
@@ -258,6 +291,24 @@ def main():
         help="The config as a json file.",
     )
     parser.add_argument("--cfg-coef", type=float, default=1.0, help="CFG coefficient.")
+    parser.add_argument(
+        "--text-prompt",
+        type=str,
+        default="",
+        help="Role text for the Hybrid System Prompt (wrapped in <system> tags if missing).",
+    )
+    parser.add_argument(
+        "--voice-prompt",
+        type=str,
+        default="",
+        help="Voice wav or .pt codes file (basename if --voice-prompt-dir is set).",
+    )
+    parser.add_argument(
+        "--voice-prompt-dir",
+        type=str,
+        default=None,
+        help="Directory of voice prompts.",
+    )
     parser.add_argument("infile", type=str, help="Input audio file.")
     parser.add_argument(
         "outfile",
@@ -289,6 +340,10 @@ def main():
     in_pcms = torch.from_numpy(in_pcms).to(device=args.device)
     in_pcms = in_pcms[None, 0:1].expand(args.batch_size, -1, -1)
 
+    voice_path = args.voice_prompt or None
+    if voice_path and args.voice_prompt_dir:
+        voice_path = str(Path(args.voice_prompt_dir) / args.voice_prompt)
+
     state = InferenceState(
         checkpoint_info,
         mimi,
@@ -299,7 +354,7 @@ def main():
         args.device,
         **checkpoint_info.lm_gen_config,
     )
-    out_items = state.run(in_pcms)
+    out_items = state.run(in_pcms, text_prompt=args.text_prompt, voice_path=voice_path)
 
     if args.outfile:
         outfile = Path(args.outfile)

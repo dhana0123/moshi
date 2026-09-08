@@ -22,23 +22,34 @@ Alignment = tuple[str, tuple[float, float], str]
 TokenizedAlignment = tuple[list[int], tuple[float, float], str]
 
 
+from ...models.hybrid_prompt import (
+    HybridPromptConfig,
+    build_hybrid_system_prefix,
+    encode_wav_agent_codes,
+    wrap_with_system_tags,
+)
+
+
 @dataclass
 class Sample:
     codes: torch.Tensor
     condition_attributes: ConditionAttributes | None = None
+    prefix_frames: int = 0
 
 
 @dataclass
 class Batch:
     codes: torch.Tensor
     condition_attributes: list[ConditionAttributes] | None = None
+    prefix_frames: torch.Tensor | None = None
 
     @classmethod
     def collate(cls, batch: list[Sample]) -> "Batch":
         codes = torch.cat([b.codes for b in batch])
+        prefix = torch.tensor([b.prefix_frames for b in batch], dtype=torch.long)
         if batch[0].condition_attributes is None:
-            return Batch(codes)
-        return Batch(codes, [b.condition_attributes for b in batch])
+            return Batch(codes, prefix_frames=prefix)
+        return Batch(codes, [b.condition_attributes for b in batch], prefix_frames=prefix)
 
 
 def tokenize(
@@ -207,11 +218,55 @@ def _dicho(alignment, val, i=0, j=None):
 
 
 class InterleavedTokenizer:
-    def __init__(self, mimi, interleaver: Interleaver, duration_sec: float):
+    def __init__(
+        self,
+        mimi,
+        interleaver: Interleaver,
+        duration_sec: float,
+        hybrid: HybridPromptConfig | None = None,
+        n_q: int | None = None,
+        dep_q: int | None = None,
+    ):
         self.mimi = mimi
         self.interleaver = interleaver
         self.duration_sec = duration_sec
         self.num_audio_frames = math.ceil(duration_sec * mimi.frame_rate)
+        self.hybrid = hybrid or HybridPromptConfig()
+        self.n_q = n_q
+        self.dep_q = dep_q
+        self._voice_cache: dict[str, torch.Tensor] = {}
+        self._rng = np.random.default_rng()
+
+    def _voice_codes(self, dep_q: int) -> torch.Tensor | None:
+        files = self.hybrid.list_voice_files()
+        if not files:
+            return None
+        path = files[int(self._rng.integers(0, len(files)))]
+        cached = self._voice_cache.get(str(path))
+        if cached is not None:
+            return cached
+        if path.suffix.lower() == ".pt":
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=True)
+            except TypeError:
+                payload = torch.load(path, map_location="cpu")
+            codes = payload["codes"] if isinstance(payload, dict) and "codes" in payload else payload
+            if not torch.is_tensor(codes):
+                return None
+            if codes.dim() == 3:
+                codes = codes[0]
+            encoded = codes.to(dtype=torch.long)
+        else:
+            try:
+                import sphn
+            except ImportError:
+                return None
+            wav, _ = sphn.read(str(path), sample_rate=self.mimi.sample_rate)
+            encoded = encode_wav_agent_codes(self.mimi, wav).cpu()
+        if encoded.shape[0] > dep_q:
+            encoded = encoded[:dep_q]
+        self._voice_cache[str(path)] = encoded
+        return encoded
 
     def __call__(self, wav: np.ndarray, start_sec: float, path: str) -> Sample:
         device = next(self.mimi.parameters()).device
@@ -254,4 +309,35 @@ class InterleavedTokenizer:
             value=self.interleaver.zero_padding,
         )
         codes = torch.cat([text_tokens, audio_tokens], dim=1)
-        return Sample(codes, data.get("text_conditions", None))
+        prefix_frames = 0
+        if self.hybrid.enabled and self._rng.random() < self.hybrid.proba:
+            n_q = self.n_q if self.n_q is not None else audio_tokens.shape[1]
+            dep_q = self.dep_q if self.dep_q is not None else min(8, n_q)
+            info_prompt = data.get("system_prompt")
+            prompt_text = info_prompt if info_prompt else self.hybrid.sample_system_prompt(self._rng)
+            tok_ids = self.interleaver.tokenizer.encode(wrap_with_system_tags(prompt_text))
+            if isinstance(tok_ids, list) and tok_ids and isinstance(tok_ids[0], list):
+                tok_ids = tok_ids[0]
+            prefix = build_hybrid_system_prefix(
+                list(tok_ids),
+                n_q=n_q,
+                dep_q=dep_q,
+                pad_id=self.hybrid.pad_id,
+                silence_frames=self.hybrid.silence_frames(self.mimi.frame_rate),
+                voice_codes=self._voice_codes(dep_q),
+                device=codes.device,
+            )
+            prefix_frames = prefix.shape[-1]
+            if prefix_frames > 0:
+                keep = max(0, codes.shape[-1] - prefix_frames)
+                codes = torch.cat([prefix.to(codes.device), codes[..., :keep]], dim=-1)
+                if codes.shape[-1] < self.num_audio_frames:
+                    codes = torch.nn.functional.pad(
+                        codes,
+                        (0, self.num_audio_frames - codes.shape[-1]),
+                        value=self.interleaver.zero_padding,
+                    )
+                elif codes.shape[-1] > self.num_audio_frames:
+                    codes = codes[..., : self.num_audio_frames]
+                    prefix_frames = min(prefix_frames, self.num_audio_frames)
+        return Sample(codes, data.get("text_conditions", None), prefix_frames=prefix_frames)

@@ -10,5 +10,6 @@ from .compression import (
     CompressionModel,
     MimiModel,
 )
+from .hybrid_prompt import wrap_with_system_tags
 from .lm import LMModel, LMGen
 from .loaders import get_mimi, get_moshi_lm
