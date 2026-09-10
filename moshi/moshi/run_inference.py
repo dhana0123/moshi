@@ -33,7 +33,9 @@ def seed_all(seed):
 
 
 def get_condition_tensors(
-    model_type: str, lm: LMModel, batch_size: int, cfg_coef: float
+    model_type: str, lm: LMModel, batch_size: int, cfg_coef: float,
+    reference_text: str | None = None,
+    first_speaker: str = "model",
 ) -> ConditionTensors:
     condition_tensors = {}
     if lm.condition_provider is not None and lm.condition_provider.conditioners:
@@ -44,11 +46,28 @@ def get_condition_tensors(
                 for _ in range(batch_size)
             ]
             if cfg_coef != 1.0:
-                # Extending the conditions with the negatives for the CFG.
                 conditions += [
                     ConditionAttributes(text={"description": "very_bad"}, tensor={})
                     for _ in range(batch_size)
                 ]
+        elif model_type == "moshi":
+            text_contributs: dict = {}
+            if reference_text is not None:
+                text_contributs["reference_with_time"] = reference_text
+            names = set(lm.condition_provider.conditioners.keys())
+            if "first_speaker" in names:
+                if first_speaker == "model":
+                    text_contributs["first_speaker"] = "SPEAKER_MAIN"
+                elif first_speaker == "user":
+                    text_contributs["first_speaker"] = "SPEAKER_OTHER"
+                else:
+                    raise ValueError(f"Invalid first speaker: {first_speaker}")
+            if "reference_with_time" in names and "reference_with_time" not in text_contributs:
+                text_contributs["reference_with_time"] = ""
+            conditions = [
+                ConditionAttributes(text=text_contributs, tensor={})
+                for _ in range(batch_size)
+            ]
         else:
             raise RuntimeError(
                 f"Model expects conditioning but model type {model_type} is not supported."

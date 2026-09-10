@@ -295,8 +295,16 @@ class CheckpointInfo:
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
         load_weight: bool = True,
+        skip_conditioners: list[str] | None = None,
         **kwargs,
     ) -> LMModel:
+        if skip_conditioners and self.lm_config:
+            for name in skip_conditioners:
+                self.lm_config.get("conditioners", {}).pop(name, None)
+                fuser = self.lm_config.get("fuser") or {}
+                for key, val in fuser.items():
+                    if isinstance(val, list) and name in val:
+                        val.remove(name)
         model = get_moshi_lm(
             self.moshi_weights if load_weight else None,
             lm_kwargs=self.lm_config,
@@ -455,6 +463,12 @@ def get_conditioner(
     if conditioner_type == "lut":
         from ..conditioners.text import LUTConditioner
         return LUTConditioner(**conditioner_kwargs)
+    elif conditioner_type == "arc_encoder":
+        from ..conditioners.arc_encoder import ArcEncoderConditioner
+        return ArcEncoderConditioner(**conditioner_kwargs)
+    elif conditioner_type == "multi_arc_encoder":
+        from ..conditioners.arc_encoder import MultiArcEncoderConditioner
+        return MultiArcEncoderConditioner(**conditioner_kwargs)
     elif conditioner_type == "tensor":
         from ..conditioners.tensors import TensorConditioner
         return TensorConditioner(**conditioner_kwargs)
@@ -476,7 +490,7 @@ def get_conditioner_provider(
 def get_condition_fuser(cfg: dict) -> ConditionFuser:
     """Instantiate a condition fuser object."""
     fuser_cfg = cfg["fuser"]
-    fuser_methods = ["sum", "cross", "prepend"]
+    fuser_methods = ["sum", "cross", "prepend", "streaming_sum"]
     fuse2cond = {k: fuser_cfg.get(k, []) for k in fuser_methods}
     kwargs = {k: v for k, v in fuser_cfg.items() if k not in fuser_methods}
     fuser = ConditionFuser(fuse2cond=fuse2cond, **kwargs)

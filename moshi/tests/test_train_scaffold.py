@@ -197,3 +197,39 @@ def test_lmgen_forced_hybrid_step():
         assert state is not None
         assert int(state.offset_cpu) >= 4
 
+
+def test_rag_token_id_and_streaming_sum():
+    from moshi.conditioners.base import ConditionFuser
+
+    model = _tiny_lm()
+    assert model.rag_token_id is None
+    rag_lm = lm_mod.LMModel(
+        delays=[0, 0, 1, 1],
+        n_q=3,
+        dep_q=3,
+        card=32,
+        text_card=48,
+        dim=16,
+        num_layers=1,
+        num_heads=1,
+        hidden_scale=1,
+        depformer_dim=16,
+        depformer_multi_linear=True,
+        depformer_weights_per_step=True,
+        depformer_num_heads=1,
+        depformer_gating="silu",
+        context=4,
+        dtype=torch.float32,
+        rag_token_id=4,
+    )
+    assert rag_lm.rag_token_id == 4
+
+    fuser = ConditionFuser(fuse2cond={"sum": [], "cross": [], "prepend": [], "streaming_sum": ["reference_with_time"]})
+    dummy = torch.zeros(1, 2, 16)
+    mask = torch.ones(1, 2)
+    from moshi.conditioners.base import ConditionType
+    summed = fuser.get_streaming_sum({"reference_with_time": ConditionType(dummy, mask)})
+    assert summed is not None
+    assert summed.shape == (1, 2, 16)
+
+

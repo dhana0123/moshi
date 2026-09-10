@@ -24,6 +24,10 @@ from .client_utils import log
 from .models import loaders, MimiModel, LMModel, LMGen
 from .models.hybrid_prompt import wrap_with_system_tags
 from .run_inference import get_condition_tensors
+from .inference_utils.rag_manager import RAGManager
+from .inference_utils.turn_manager import TurnManager
+from .inference_utils.utils import get_conditioning_remote_async
+from .reference import LLMReferenceGenerator
 
 
 def seed_all(seed):
@@ -55,12 +59,14 @@ class ServerState:
         self.mimi = mimi
         self.text_tokenizer = text_tokenizer
         condition_tensors = get_condition_tensors(model_type, lm, batch_size=1, cfg_coef=cfg_coef)
+        force_streaming_sum = kwargs.pop("force_streaming_sum", lm.rag_token_id is not None)
         self.lm_gen = LMGen(
             lm,
             cfg_coef=cfg_coef,
             condition_tensors=condition_tensors,
             sample_rate=int(mimi.sample_rate),
             frame_rate=float(mimi.frame_rate),
+            force_streaming_sum=force_streaming_sum,
             **kwargs,
         )
 
@@ -70,6 +76,9 @@ class ServerState:
         self.voice_prompt_dir = voice_prompt_dir
         self.default_text_prompt = default_text_prompt
         self.default_voice_prompt = default_voice_prompt
+        self.reference_encoder_url = os.environ.get("REFERENCE_ENCODER_URL")
+        self.rag_enabled = lm.rag_token_id is not None and bool(self.reference_encoder_url)
+        self.stt_wait_steps = int(0.5 * mimi.frame_rate)
 
         self.mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
@@ -112,7 +121,11 @@ class ServerState:
         self,
         tokens: torch.Tensor,
         ws: web.WebSocketResponse,
-        opus_writer: sphn.OpusStreamWriter
+        opus_writer: sphn.OpusStreamWriter,
+        *,
+        rag_manager: RAGManager | None = None,
+        turn_manager: TurnManager | None = None,
+        task_group: asyncio.TaskGroup | None = None,
     ):
         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
         main_pcm = self.mimi.decode(tokens[:, 1:])
@@ -121,18 +134,50 @@ class ServerState:
         if len(opus_bytes) > 0:
             await ws.send_bytes(b"\x01" + opus_bytes)
         text_token = tokens[0, 0, 0].item()
-        if text_token not in (0, 3):
+        rag_id = self.lm_gen.lm_model.rag_token_id
+        if rag_manager is not None and rag_id is not None and text_token == rag_id:
+            log("info", "[RAG] model emitted RAG token")
+            if turn_manager is not None:
+                turn_manager.handle_spoken_text(model_text="[RET]")
+            await ws.send_bytes(b"\x02" + b"[RET]")
+            if task_group is not None:
+                await rag_manager.trigger(
+                    task_group=task_group,
+                    wait_steps=self.stt_wait_steps,
+                    handle_reference_fn=self._handle_reference_text,
+                    context_provider=(turn_manager.get_context if turn_manager is not None else None),
+                )
+        elif text_token not in (0, 3):
             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
             _text = _text.replace("▁", " ")
+            if turn_manager is not None:
+                turn_manager.handle_spoken_text(model_text=_text)
             msg = b"\x02" + bytes(_text, encoding="utf8")
             log("info", f"text token '{_text}'")
             await ws.send_bytes(msg)
+        if rag_manager is not None:
+            rag_manager.step()
+
+    async def _handle_reference_text(self, reference_text: str | None, lm_label: str = "") -> None:
+        if not reference_text or not self.reference_encoder_url:
+            return
+        streaming_sum_tensor = await get_conditioning_remote_async(
+            text=reference_text,
+            encoder_url=self.reference_encoder_url,
+        )
+        per_slot: list[torch.Tensor | None] = [streaming_sum_tensor.squeeze(0)]
+        self.lm_gen.update_streaming_sum_tensors(per_slot)
+        log("info", f"[RAG] injected streaming_sum {tuple(streaming_sum_tensor.shape)} lm={lm_label!r}")
 
     async def recv_loop(
         self,
         ws: web.WebSocketResponse,
         opus_reader: sphn.OpusStreamReader,
-        opus_writer: sphn.OpusStreamWriter
+        opus_writer: sphn.OpusStreamWriter,
+        *,
+        rag_manager: RAGManager | None = None,
+        turn_manager: TurnManager | None = None,
+        task_group: asyncio.TaskGroup | None = None,
     ):
         all_pcm_data = None
         skip_frames = 1
@@ -181,7 +226,12 @@ class ServerState:
                             tokens = self.lm_gen.step(codes[:, :, c: c + 1])
                             if tokens is None:
                                 continue
-                            await self.decode_and_send(tokens, ws, opus_writer)
+                            await self.decode_and_send(
+                                tokens, ws, opus_writer,
+                                rag_manager=rag_manager,
+                                turn_manager=turn_manager,
+                                task_group=task_group,
+                            )
                         log("info", f"frame handled in {1000 * (time.time() - be):.1f}ms")
                 else:
                     log("warning", f"unknown message kind {kind}")
@@ -206,9 +256,19 @@ class ServerState:
                 log("info", f"hybrid prompt text={text_prompt!r} voice={voice_prompt!r}")
                 self.lm_gen.step_system_prompts(self.mimi)
                 self.mimi.reset_streaming()
-            # Send the handshake.
             await ws.send_bytes(b"\x00")
-            await self.recv_loop(ws, opus_reader, opus_writer)
+            turn_manager = TurnManager() if self.rag_enabled else None
+            if self.rag_enabled:
+                async with RAGManager(LLMReferenceGenerator()) as rag_manager:
+                    async with asyncio.TaskGroup() as tg:
+                        await self.recv_loop(
+                            ws, opus_reader, opus_writer,
+                            rag_manager=rag_manager,
+                            turn_manager=turn_manager,
+                            task_group=tg,
+                        )
+            else:
+                await self.recv_loop(ws, opus_reader, opus_writer)
         log("info", "done with connection")
         return ws
 
@@ -277,7 +337,11 @@ def main():
     text_tokenizer = checkpoint_info.get_text_tokenizer()
 
     log("info", "loading moshi")
-    lm = checkpoint_info.get_moshi(device=args.device, dtype=args.dtype, fuse_lora=args.fuse_lora)
+    skip_conditioners = ["reference_with_time"] if os.environ.get("REFERENCE_ENCODER_URL") else []
+    lm = checkpoint_info.get_moshi(
+        device=args.device, dtype=args.dtype, fuse_lora=args.fuse_lora,
+        skip_conditioners=skip_conditioners,
+    )
     log("info", "moshi loaded")
 
     state = ServerState(

@@ -1,0 +1,98 @@
+{
+  "card": 2048,
+  "n_q": 16,
+  "dep_q": 8,
+  "delays": [
+    0,
+    0,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    0,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
+  "dim": 4096,
+  "text_card": 32000,
+  "existing_text_padding_id": 3,
+  "rag_token_id": 4,
+  "num_heads": 32,
+  "num_layers": 32,
+  "hidden_scale": 4.125,
+  "causal": true,
+  "layer_scale": null,
+  "context": 3000,
+  "max_period": 10000,
+  "gating": "silu",
+  "norm": "rms_norm_f32",
+  "positional_embedding": "rope",
+  "depformer_dim": 1024,
+  "depformer_num_heads": 16,
+  "depformer_num_layers": 6,
+  "depformer_dim_feedforward": null,
+  "depformer_multi_linear": true,
+  "depformer_pos_emb": "none",
+  "depformer_weights_per_step": true,
+  "demux_second_stream": false,
+  "text_card_out": null,
+  "conditioners": {
+    "first_speaker": {
+      "type": "lut",
+      "lut": {
+        "n_bins": 2,
+        "dim": 16,
+        "tokenizer": "noop",
+        "possible_values": [
+          "SPEAKER_MAIN",
+          "SPEAKER_OTHER"
+        ]
+      }
+    },
+    "reference_with_time": {
+      "type": "multi_arc_encoder",
+      "multi_arc_encoder": {
+        "embedder_params": {
+          "compress_rates": [-4]
+        },
+        "bridge_module": {
+          "in_dim": 3072,
+          "out_dim": 4096,
+          "hidden_dim": 2048
+        },
+        "hf_repo": "kyutai/ARC4_Encoder_Llama",
+        "finetune": false,
+        "ref_dropout": 0.2,
+        "frame_rate": 12.5,
+        "learn_padding": true,
+        "rag_time_sampling_params": {
+          "start_delay": 1.0,
+          "end_gap": 1.0,
+          "random_sampling_proba": 0.2
+        }
+      }
+    }
+  },
+  "fuser": {
+    "cross_attention_pos_emb": false,
+    "cross_attention_pos_emb_scale": 1,
+    "sum": [],
+    "streaming_sum": [
+      "reference_with_time"
+    ],
+    "prepend": [
+      "first_speaker"
+    ],
+    "cross": []
+  },
+  "cross_attention": false,
+  "model_id": {}
+}

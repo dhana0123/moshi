@@ -361,7 +361,7 @@ class ConditionFuser(nn.Module):
         cross_attention_pos_emb (bool, optional): Use positional embeddings in cross attention.
         cross_attention_pos_emb_scale (int): Scale for positional embeddings in cross attention if used.
     """
-    FUSING_METHODS = ["sum", "prepend", "cross"]
+    FUSING_METHODS = ["sum", "prepend", "cross", "streaming_sum"]
 
     def __init__(self, fuse2cond: tp.Dict[str, tp.List[str]], cross_attention_pos_emb: bool = False,
                  cross_attention_pos_emb_scale: float = 1.0):
@@ -376,8 +376,8 @@ class ConditionFuser(nn.Module):
         for fuse_method, conditions in fuse2cond.items():
             for condition in conditions:
                 self.cond2fuse[condition] = fuse_method
-                if fuse_method not in ['cross', 'sum']:
-                    raise RuntimeError("only `sum` and `cross` conditionings are supported "
+                if fuse_method not in ['cross', 'sum', 'prepend', 'streaming_sum']:
+                    raise RuntimeError("only `sum`, `cross`, `prepend` and `streaming_sum` conditionings are supported "
                                        f"for now, got {fuse_method}.")
 
     @property
@@ -387,12 +387,12 @@ class ConditionFuser(nn.Module):
     @property
     def has_prepend(self) -> bool:
         """Is there a conditioning that needs to be prepending to the Transformer sequence."""
-        return bool(self.fuse2cond['prepend'])
+        return bool(self.fuse2cond.get('prepend'))
 
     def get_cross(self, conditions: ConditionTensors) -> torch.Tensor | None:
         """Return the tensor to be provided for the cross attention."""
         cross = None
-        for name in self.fuse2cond['cross']:
+        for name in self.fuse2cond.get("cross", []):
             cond, _ = conditions[name]
             if cross is None:
                 cross = cond
@@ -411,7 +411,7 @@ class ConditionFuser(nn.Module):
     def get_sum(self, conditions: ConditionTensors) -> torch.Tensor | None:
         """Return the tensor to be provided as an extra sum offset shared for each step."""
         sum = None
-        for name in self.fuse2cond['sum']:
+        for name in self.fuse2cond.get("sum", []):
             cond, _ = conditions[name]
             assert cond.shape[1] == 1, cond.shape
             if sum is None:
@@ -423,7 +423,7 @@ class ConditionFuser(nn.Module):
     def get_prepend(self, conditions: ConditionTensors) -> torch.Tensor | None:
         """Return the tensor to be prepended to the transformer."""
         prepend = None
-        for name in self.fuse2cond['prepend']:
+        for name in self.fuse2cond.get("prepend", []):
             cond, _ = conditions[name]
             if prepend is None:
                 prepend = cond
@@ -434,3 +434,24 @@ class ConditionFuser(nn.Module):
             if sum is not None:
                 prepend = prepend + sum
         return prepend
+
+    def get_streaming_sum(self, conditions: ConditionTensors) -> torch.Tensor | None:
+        """Return the tensor sequence to be provided as an extra streaming sum offset for each step."""
+        if "streaming_sum" not in self.fuse2cond:
+            return None
+        sum = None
+        for name in self.fuse2cond.get("streaming_sum", []):
+            cond, mask = conditions[name]
+            cond = cond * mask.unsqueeze(-1)
+            if sum is None:
+                sum = cond
+            else:
+                max_len = max(sum.shape[1], cond.shape[1])
+                if sum.shape[1] < max_len:
+                    cond = cond.clone()
+                    cond[:, : sum.shape[1]] += sum
+                    sum = cond
+                else:
+                    sum = sum.clone()
+                    sum[:, : cond.shape[1]] += cond
+        return sum

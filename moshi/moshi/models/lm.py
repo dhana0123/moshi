@@ -83,6 +83,7 @@ class LMModel(StreamingContainer):
         depformer_weights_per_step_schedule (list[int] | None): mapping `CODEBOOK_INDEX -> WEIGHT_INDEX`, allowing
         depformer_low_rank_embeddings (int | None): if provided, uses low rank embeddings, with a linear
         existing_text_padding_id (int): token to use for the padding.
+        rag_token_id (int): special token indicating trigger of RAG.
         same_initial (bool): if True, uses the same initial tokens for both text and audio mode.
         **kwargs: Additional parameters for the transformer encoder.
     """
@@ -112,6 +113,7 @@ class LMModel(StreamingContainer):
         depformer_norm: str | None = None,
         existing_text_padding_id: int = 3,
         existing_text_end_padding_id: int = 0,
+        rag_token_id: tp.Optional[int] = None,
         extra_heads_num_heads: int = 0,
         extra_heads_dim: int = 6,
         context: tp.Optional[int] = None,
@@ -135,6 +137,7 @@ class LMModel(StreamingContainer):
         self.dim = dim
         self.existing_text_padding_id = existing_text_padding_id
         self.existing_text_end_padding_id = existing_text_end_padding_id
+        self.rag_token_id = rag_token_id
         self.context = context
         self.depformer_weights_per_step_schedule = depformer_weights_per_step_schedule
         if depformer_weights_per_step_schedule is not None:
@@ -367,14 +370,21 @@ class LMModel(StreamingContainer):
 
         sum_condition: torch.Tensor | None = None
         cross_attention_src: torch.Tensor | None = None
+        streaming_sum_condition: torch.Tensor | None = None
         if condition_tensors is None:
             assert self.fuser is None
         else:
             assert self.fuser is not None
             sum_condition = self.fuser.get_sum(condition_tensors)
             cross_attention_src = self.fuser.get_cross(condition_tensors)
+            streaming_sum_condition = self.fuser.get_streaming_sum(condition_tensors)
 
-        transformer_out, text_logits = self.forward_text(delayed_codes[:, :, :-1], sum_condition, cross_attention_src)
+        transformer_out, text_logits = self.forward_text(
+            delayed_codes[:, :, :-1],
+            sum_condition,
+            cross_attention_src,
+            streaming_sum_condition,
+        )
         assert transformer_out.shape[0] == delayed_codes.shape[0]
         assert transformer_out.shape[1] == delayed_codes.shape[2] - 1
         logits = self.forward_depformer_training(delayed_codes[:, :, 1:], transformer_out)
@@ -394,6 +404,7 @@ class LMModel(StreamingContainer):
         self,
         sequence: torch.Tensor, sum_condition: torch.Tensor | None = None,
         cross_attention_src: torch.Tensor | None = None,
+        streaming_sum_condition: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, K, S = sequence.shape
         assert (
@@ -411,6 +422,8 @@ class LMModel(StreamingContainer):
         input_ = text_emb if input_ is None else input_ + text_emb
         if sum_condition is not None:
             input_ = input_ + sum_condition.to(input_)
+        if streaming_sum_condition is not None and streaming_sum_condition.shape[1] > 0:
+            input_ = input_ + streaming_sum_condition.to(input_)
         if cross_attention_src is not None:
             cross_attention_src = cross_attention_src.to(input_)
         transformer_out = self.transformer(input_, cross_attention_src=cross_attention_src)
@@ -543,6 +556,8 @@ class _LMGenState(State):
     offset_cpu: int = 0
     condition_sum: torch.Tensor | None = None
     condition_cross: torch.Tensor | None = None
+    condition_streaming_sum: torch.Tensor | None = None
+    pending_streaming_sums: list[torch.Tensor | None] = field(default_factory=list)
     cfg_is_masked_until: torch.Tensor | None = None
     exit_stack: ExitStack = field(default_factory=ExitStack)
     reset_callback: tp.Callable[[torch.Tensor], None] | None = None
@@ -589,6 +604,7 @@ class LMGen(StreamingModule[_LMGenState]):
         text_prompt_tokens: list[int] | None = None,
         sample_rate: int = 24000,
         frame_rate: float = 12.5,
+        force_streaming_sum: bool = False,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -628,6 +644,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt: str | None = None
         self.voice_prompt_audio: np.ndarray | None = None
         self.voice_prompt_codes: torch.Tensor | None = None
+        self.force_streaming_sum = force_streaming_sum
         if self.cfg_coef != 1.:
             if not self.cfg_is_no_text and not self.cfg_is_masked_until:
                 assert self.lm_model.fuser is not None, "Model has no fuser, cannot do CFG."
@@ -648,14 +665,22 @@ class LMGen(StreamingModule[_LMGenState]):
             assert not self.condition_tensors
             condition_sum = None
             condition_cross = None
+            condition_streaming_sum = None
         else:
             assert self.condition_tensors is not None
             condition_sum = self.lm_model.fuser.get_sum(self.condition_tensors)
             condition_cross = self.lm_model.fuser.get_cross(self.condition_tensors)
+            condition_streaming_sum = self.lm_model.fuser.get_streaming_sum(self.condition_tensors)
             if condition_sum is not None:
                 condition_sum = condition_sum.to(self.lm_model.dtype)
             if condition_cross is not None:
                 condition_cross = condition_cross.to(self.lm_model.dtype)
+            if condition_streaming_sum is not None:
+                condition_streaming_sum = condition_streaming_sum.to(self.lm_model.dtype)
+            if self.force_streaming_sum and condition_streaming_sum is None:
+                condition_streaming_sum = torch.zeros(
+                    batch_size, 1, lm_model.dim, device=lm_model.device, dtype=lm_model.dtype
+                )
 
         disable = lm_model.device.type != 'cuda'
         graphed_main = CUDAGraphed(lm_model.forward_text, disable=disable)
@@ -672,6 +697,8 @@ class LMGen(StreamingModule[_LMGenState]):
         state = _LMGenState(
             batch_size, lm_model.device, cache, initial, graphed_main, graphed_depth,
             offsets, condition_sum=condition_sum, condition_cross=condition_cross,
+            condition_streaming_sum=condition_streaming_sum,
+            pending_streaming_sums=[None] * batch_size,
             cfg_is_masked_until=cfg_is_masked_until)
 
         if self.cfg_coef != 1.:
@@ -680,12 +707,17 @@ class LMGen(StreamingModule[_LMGenState]):
                 assert state.condition_sum.shape[0] == batch_size, "cfg requires 2x more conditions."
             if state.condition_cross is not None:
                 assert state.condition_cross.shape[0] == batch_size, "cfg requires 2x more conditions."
+            if state.condition_streaming_sum is not None:
+                assert state.condition_streaming_sum.shape[0] == batch_size, "cfg requires 2x more conditions."
         state.exit_stack.enter_context(self.lm_model.streaming(batch_size))
 
         def _reset_callback(reset_mask: torch.Tensor) -> None:
             if self.cfg_coef != 1.:
                 reset_mask = reset_mask.repeat(2)
             self.lm_model.reset_streaming(reset_mask)
+            for b, reset in enumerate(reset_mask.tolist()[: len(state.pending_streaming_sums)]):
+                if reset:
+                    state.pending_streaming_sums[b] = None
 
         def _set_exec_mask_callback(exec_mask: torch.Tensor) -> None:
             if self.cfg_coef != 1.:
@@ -695,6 +727,37 @@ class LMGen(StreamingModule[_LMGenState]):
         state.reset_callback = _reset_callback
         state.set_exec_mask_callback = _set_exec_mask_callback
         return state
+
+    def update_streaming_sum_tensors(self, tensors: list[torch.Tensor | None]):
+        """Set pending streaming-sum tensors, one per batch slot. Each is None or [T, dim]."""
+        assert self.cfg_coef == 1.0, "Per-slot streaming_sum update requires cfg_coef == 1."
+        state = self._streaming_state
+        assert state is not None
+        assert len(tensors) == state.batch_size, f"Expected {state.batch_size} tensors, got {len(tensors)}"
+        device = self.lm_model.device
+        dtype = self.lm_model.dtype
+        for b, t in enumerate(tensors):
+            if t is not None:
+                state.pending_streaming_sums[b] = t.to(device=device, dtype=dtype)
+
+    def apply_pending_streaming_sum_condition(self, exec_mask: torch.Tensor | None = None):
+        """Consume one step of pending streaming-sum for each executing slot."""
+        state = self._streaming_state
+        assert state is not None
+        if state.condition_streaming_sum is None:
+            return
+        if exec_mask is None:
+            exec_mask = state.exec_mask
+        exec_list = exec_mask.tolist() if exec_mask.dim() == 1 else exec_mask.view(-1).tolist()
+        for b in range(state.batch_size):
+            if not exec_list[b]:
+                continue
+            pending = state.pending_streaming_sums[b]
+            if pending is not None and pending.shape[0] > 0:
+                state.condition_streaming_sum[b, 0] = pending[0]
+                state.pending_streaming_sums[b] = pending[1:] if pending.shape[0] > 1 else None
+            else:
+                state.condition_streaming_sum[b, 0].zero_()
 
     @torch.no_grad()
     def _step(self, input_tokens: torch.Tensor,
@@ -708,6 +771,8 @@ class LMGen(StreamingModule[_LMGenState]):
                 "You should wrap those calls with a `with lm_gen.streaming(): ...`."
             )
         lm_model = self.lm_model
+        if state.condition_streaming_sum is not None:
+            self.apply_pending_streaming_sum_condition(state.exec_mask)
 
         assert input_tokens.dim() == 3, "Shape should be [B, K, T]."
         B, Ki, S = input_tokens.shape
@@ -779,7 +844,9 @@ class LMGen(StreamingModule[_LMGenState]):
             if self.cfg_is_no_text:
                 input_[B:, :1] = torch.where(~is_init[:, :1], zero, input_[B:, :1])
 
-        transformer_out, text_logits = state.graphed_main(input_, state.condition_sum, state.condition_cross)
+        transformer_out, text_logits = state.graphed_main(
+            input_, state.condition_sum, state.condition_cross, state.condition_streaming_sum
+        )
         if self.cfg_coef != 1.:
             logits, logits_null = text_logits.chunk(2)
             if self.cfg_is_no_text:
@@ -1019,6 +1086,9 @@ class LMGen(StreamingModule[_LMGenState]):
         if state is not None:
             state.cache.fill_(self.lm_model.ungenerated_token_id)
             state.offset_cpu = 0
+            state.pending_streaming_sums = [None] * state.batch_size
+            if state.condition_streaming_sum is not None:
+                state.condition_streaming_sum.zero_()
 
     def depformer_step(
         self,
