@@ -45,13 +45,22 @@ class DiarizationResult:
 
 @contextmanager
 def _torch_load_compat_for_pyannote():
-    """PyTorch>=2.6 defaults weights_only=True; pyannote Lightning ckpts need False."""
+    """PyTorch>=2.6 + older pyannote: force full pickle load for trusted HF ckpts.
+
+    lightning_fabric often calls ``torch.load(..., weights_only=True)`` explicitly,
+    so ``setdefault`` is not enough — we must overwrite. Also set the torch env
+    escape hatch documented for this case.
+    """
     import torch
 
+    prev_env = os.environ.get("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD")
+    os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+
+    safe = []
     try:
         from torch.torch_version import TorchVersion
 
-        torch.serialization.add_safe_globals([TorchVersion])
+        safe.append(TorchVersion)
     except Exception:
         pass
     try:
@@ -59,14 +68,26 @@ def _torch_load_compat_for_pyannote():
         from omegaconf.dictconfig import DictConfig
         from omegaconf.listconfig import ListConfig
 
-        torch.serialization.add_safe_globals([DictConfig, ListConfig, ContainerMetadata])
+        safe.extend([DictConfig, ListConfig, ContainerMetadata])
     except Exception:
         pass
+    try:
+        from pyannote.audio.core.task import Specifications
+
+        safe.append(Specifications)
+    except Exception:
+        pass
+    if safe:
+        try:
+            torch.serialization.add_safe_globals(safe)
+        except Exception:
+            pass
 
     orig_load = torch.load
 
     def _load(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
+        # Force False even when lightning passes weights_only=True
+        kwargs["weights_only"] = False
         return orig_load(*args, **kwargs)
 
     torch.load = _load  # type: ignore[assignment]
@@ -74,6 +95,10 @@ def _torch_load_compat_for_pyannote():
         yield
     finally:
         torch.load = orig_load  # type: ignore[assignment]
+        if prev_env is None:
+            os.environ.pop("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", None)
+        else:
+            os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = prev_env
 
 
 def _write_temp_wav(mono: np.ndarray, sample_rate: int) -> str:
@@ -130,7 +155,9 @@ def load_diarization_pipeline(device: str = "cuda"):
                     DIARIZATION_MODEL, use_auth_token=token or True
                 )
     except Exception as exc:
-        raise RuntimeError(f"Failed to load {DIARIZATION_MODEL}.\n{gate_help}") from exc
+        raise RuntimeError(
+            f"Failed to load {DIARIZATION_MODEL}: {exc}\n{gate_help}"
+        ) from exc
     if pipeline is None:
         raise RuntimeError(f"Failed to load {DIARIZATION_MODEL}.\n{gate_help}")
     if device.startswith("cuda") and torch.cuda.is_available():
