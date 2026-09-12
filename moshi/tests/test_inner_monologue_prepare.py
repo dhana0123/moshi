@@ -14,6 +14,7 @@ from moshi.train.data.interleaver import Interleaver
 from moshi.train.data.prepare import (
     alignments_payload,
     asr_lang_for_indicvoices_config,
+    decode_hf_audio,
     make_dummy_dialogue,
     make_sample_dialogues,
     pack_stereo,
@@ -183,6 +184,21 @@ def test_write_three_inspect_samples(tmp_path: Path):
     assert json.loads(jsonl[0])["path"].startswith("wav/")
     assert (tmp_path / "samples" / "wav" / "01_overlap.wav").exists()
     assert (tmp_path / "samples" / "wav" / "03_backchannel.json").exists()
+
+
+def test_decode_hf_audio_from_bytes():
+    import io
+
+    import soundfile as sf
+
+    sr = 16000
+    tone = (0.1 * np.sin(2 * np.pi * 440 * np.arange(sr) / sr)).astype(np.float32)
+    buf = io.BytesIO()
+    sf.write(buf, tone, sr, format="WAV")
+    arr, out_sr = decode_hf_audio({"bytes": buf.getvalue(), "path": None})
+    assert out_sr == sr
+    assert arr.ndim == 1
+    assert abs(len(arr) - sr) <= 1
 
 
 def test_whisperx_align_model_map_and_split():

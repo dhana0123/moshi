@@ -325,6 +325,60 @@ def process_stereo_array(
     )
 
 
+def _audio_column_name(features) -> str:
+    names = list(getattr(features, "keys", lambda: features)())
+    for key in ("audio_filepath", "audio"):
+        if key in names:
+            return key
+    raise KeyError(f"No audio column in features: {names}")
+
+
+def decode_hf_audio(audio) -> tuple[np.ndarray, int]:
+    """Decode HF Audio path/bytes/array without torchcodec (soundfile)."""
+    if audio is None:
+        raise ValueError("audio is None")
+    # Legacy / already-decoded
+    if isinstance(audio, dict) and audio.get("array") is not None:
+        return np.asarray(audio["array"], dtype=np.float32), int(
+            audio.get("sampling_rate") or SAMPLE_RATE
+        )
+    # path/bytes dict from Audio(decode=False)
+    if isinstance(audio, dict):
+        raw = audio.get("bytes")
+        path = audio.get("path")
+        try:
+            import soundfile as sf
+        except ImportError as exc:
+            raise ImportError("pip install soundfile to decode IndicVoices audio") from exc
+        import io
+
+        if raw is not None:
+            arr, sr = sf.read(io.BytesIO(raw), always_2d=False, dtype="float32")
+        elif path:
+            local = Path(path)
+            if local.exists():
+                arr, sr = sf.read(str(local), always_2d=False, dtype="float32")
+            else:
+                # HF streaming / zip / hub path — open via datasets xopen
+                try:
+                    from datasets.utils.file_utils import xopen
+                except ImportError as exc:
+                    raise ImportError(
+                        "Need datasets to open remote audio paths, or pip install torchcodec"
+                    ) from exc
+                with xopen(path, "rb") as f:
+                    blob = f.read()
+                arr, sr = sf.read(io.BytesIO(blob), always_2d=False, dtype="float32")
+        else:
+            raise ValueError(f"Audio dict has neither array, bytes, nor path: {audio.keys()}")
+        arr = np.asarray(arr, dtype=np.float32)
+        if arr.ndim == 2:
+            # soundfile returns [T, C]; packer expects [C, T] or mono
+            arr = arr.T
+        return arr, int(sr)
+    raise TypeError(f"Unsupported audio payload type: {type(audio)}")
+
+
 def process_indicvoices(
     *,
     language_config: str,
@@ -339,19 +393,22 @@ def process_indicvoices(
         raise ImportError("pip install datasets huggingface_hub to use --indicvoices") from exc
 
     ds = load_dataset("ai4bharat/IndicVoices", language_config, split=split, streaming=streaming)
-    if not streaming:
-        ds = ds.cast_column("audio_filepath", Audio(sampling_rate=SAMPLE_RATE))
+    # datasets>=4 defaults to torchcodec; we decode with soundfile instead.
+    audio_col = _audio_column_name(ds.features)
+    ds = ds.cast_column(audio_col, Audio(decode=False))
+    if streaming and hasattr(ds, "decode"):
+        ds = ds.decode(False)
     clips: list[PackedClip] = []
     for i, row in enumerate(ds):
         if not is_conversation_row(row):
             continue
-        audio = row.get("audio_filepath") or row.get("audio")
+        audio = row.get(audio_col) or row.get("audio_filepath") or row.get("audio")
         if audio is None:
             continue
-        if isinstance(audio, dict):
-            arr = np.asarray(audio["array"], dtype=np.float32)
-            sr = int(audio.get("sampling_rate") or SAMPLE_RATE)
-        else:
+        try:
+            arr, sr = decode_hf_audio(audio)
+        except Exception as err:
+            logger.warning("Skip IndicVoices audio row %s: %s", i, err)
             continue
         stem = f"{language_config}_{split}_{i:08d}"
         try:
