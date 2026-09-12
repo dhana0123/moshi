@@ -12,8 +12,8 @@ logger = logging.getLogger("moshi.prepare.deps")
 
 # (import_name, pip_extra_hint)
 _REQUIRED: list[tuple[str, str]] = [
-    ("datasets", "datasets>=2.19,<4.0"),
-    ("pyarrow", "pyarrow>=14,<21"),
+    ("datasets", "datasets>=4.4.0"),
+    ("pyarrow", "pyarrow>=21.0.0"),
     ("soundfile", "soundfile"),
     ("huggingface_hub", "huggingface-hub"),
     ("scipy", "scipy"),
@@ -57,7 +57,8 @@ def require_data_deps(*, diarize: bool = True, asr_backend: str = "indic-conform
         "Missing or broken packer dependencies:\n  - "
         + "\n  - ".join(uniq)
         + "\n\nFix common pyarrow/datasets clash:\n"
-        "  pip install 'pyarrow>=14,<21' 'datasets>=2.19,<4.0'\n\n"
+        "  pip install -U 'datasets>=4.4.0' 'pyarrow>=21'\n"
+        "  # OR keep old datasets: pip install 'pyarrow==20.0.0'\n\n"
         "Or install extras:\n"
         "  cd moshi/moshi && pip install -e \".[data]\" --upgrade-strategy only-if-needed\n"
         "  pip install -r requirements-data.txt\n"

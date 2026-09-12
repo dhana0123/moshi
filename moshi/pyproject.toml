@@ -60,9 +60,9 @@ train = [
 # If torch/torchaudio got replaced, reinstall your CUDA wheels AFTER.
 data = [
     # Hub / I/O  (torch/torchaudio already required by moshi core — do not re-pin here)
-    # pyarrow>=21 removed PyExtensionType; older datasets still need it
-    "pyarrow>=14,<21",
-    "datasets>=2.19,<4.0",
+    # pyarrow 21+ dropped PyExtensionType — need datasets that use ExtensionType
+    "datasets>=4.4.0",
+    "pyarrow>=21.0.0",
     "huggingface-hub>=0.24",
     "soundfile>=0.12",
     "scipy>=1.11",

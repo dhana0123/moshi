@@ -19,9 +19,9 @@
 #   git clone https://github.com/AI4Bharat/NeMo.git && cd NeMo && git checkout nemo-v2
 #   pip install -e '.[asr]' --upgrade-strategy only-if-needed
 
-# datasets + pyarrow must match (pyarrow 21+ dropped PyExtensionType)
-pyarrow>=14,<21
-datasets>=2.19,<4.0
+# datasets 4.4+ works with pyarrow 21+ (PyExtensionType removed)
+datasets>=4.4.0
+pyarrow>=21.0.0
 huggingface-hub>=0.24
 soundfile>=0.12
 scipy>=1.11
