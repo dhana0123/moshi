@@ -61,28 +61,43 @@ def load_diarization_pipeline(device: str = "cuda"):
         from pyannote.audio import Pipeline
     except ImportError as exc:
         raise ImportError(
-            "Install pyannote.audio (`pip install pyannote.audio` or moshi[data]) "
+            "Install pyannote.audio (`pip install 'pyannote.audio>=3.1,<4'` or moshi[data]) "
             "for --diarize."
         ) from exc
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not token:
+        logger.warning(
+            "HF_TOKEN not set — gated pyannote models will fail. "
+            "export HF_TOKEN=... after accepting model cards."
+        )
     key = f"{DIARIZATION_MODEL}|{device}|{bool(token)}"
     if key in _pipeline_cache:
         return _pipeline_cache[key]
 
+    gate_help = (
+        "Accept these gated repos (same HF account as HF_TOKEN), then retry:\n"
+        "  https://huggingface.co/pyannote/speaker-diarization-3.1\n"
+        "  https://huggingface.co/pyannote/segmentation-3.0\n"
+        "If pyannote.audio>=4 is installed it may also need:\n"
+        "  https://huggingface.co/pyannote/speaker-diarization-community-1\n"
+        "Preferred fix: pip install 'pyannote.audio>=3.1,<4'"
+    )
+
     kwargs = {"token": token} if token else {}
     try:
         logger.info("Loading diarization pipeline %s …", DIARIZATION_MODEL)
-        pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, **kwargs)
-    except TypeError:
-        # Older pyannote used use_auth_token=
-        pipeline = Pipeline.from_pretrained(
-            DIARIZATION_MODEL, use_auth_token=token or True
-        )
+        try:
+            pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, **kwargs)
+        except TypeError:
+            # Older pyannote used use_auth_token=
+            pipeline = Pipeline.from_pretrained(
+                DIARIZATION_MODEL, use_auth_token=token or True
+            )
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load {DIARIZATION_MODEL}.\n{gate_help}") from exc
     if pipeline is None:
-        raise RuntimeError(
-            f"Failed to load {DIARIZATION_MODEL}. Accept the model cards on HF and set HF_TOKEN."
-        )
+        raise RuntimeError(f"Failed to load {DIARIZATION_MODEL}.\n{gate_help}")
     if device.startswith("cuda") and torch.cuda.is_available():
         pipeline.to(torch.device(device))
     else:

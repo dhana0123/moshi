@@ -55,24 +55,22 @@ train = [
     "pyyaml >= 6.0",
 ]
 # Dataset packer: IndicVoices → diarize → IndicConformer → WhisperX → HF push.
-# Install: pip install -e ".[data]"
+# Install (keep your existing CUDA torch — do NOT let extras downgrade it):
+#   pip install -e ".[data]" --upgrade-strategy only-if-needed
+# If torch/torchaudio got replaced, reinstall your CUDA wheels AFTER.
 data = [
-    # Hub / I/O
+    # Hub / I/O  (torch/torchaudio already required by moshi core — do not re-pin here)
     "datasets>=2.19",
     "huggingface-hub>=0.24",
     "soundfile>=0.12",
     "scipy>=1.11",
     "pandas>=2.0",
-    # Diarization (mono → stereo)
-    "pyannote.audio>=3.1.0",
-    "lightning>=2.0",
-    "torchmetrics>=1.0",
+    # Diarization (mono → stereo). Pin <4 so 3.1 pipeline does not pull gated community-1 PLDA.
+    "pyannote.audio>=3.1.0,<4.0",
     # Agent ASR (IndicConformer CTC)
     "nemo_toolkit[asr]",
-    "torchaudio",
     "omegaconf",
     "hydra-core",
-    "lhotse",
     # Word timing (strict WhisperX)
     "whisperx",
     "transformers>=4.40",
