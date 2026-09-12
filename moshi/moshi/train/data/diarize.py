@@ -16,6 +16,7 @@ import os
 import tempfile
 import wave
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
@@ -40,6 +41,39 @@ class DiarizationResult:
     agent_id: str
     user_id: str
     durations: dict[str, float]
+
+
+@contextmanager
+def _torch_load_compat_for_pyannote():
+    """PyTorch>=2.6 defaults weights_only=True; pyannote Lightning ckpts need False."""
+    import torch
+
+    try:
+        from torch.torch_version import TorchVersion
+
+        torch.serialization.add_safe_globals([TorchVersion])
+    except Exception:
+        pass
+    try:
+        from omegaconf.base import ContainerMetadata
+        from omegaconf.dictconfig import DictConfig
+        from omegaconf.listconfig import ListConfig
+
+        torch.serialization.add_safe_globals([DictConfig, ListConfig, ContainerMetadata])
+    except Exception:
+        pass
+
+    orig_load = torch.load
+
+    def _load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return orig_load(*args, **kwargs)
+
+    torch.load = _load  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        torch.load = orig_load  # type: ignore[assignment]
 
 
 def _write_temp_wav(mono: np.ndarray, sample_rate: int) -> str:
@@ -87,13 +121,14 @@ def load_diarization_pipeline(device: str = "cuda"):
     kwargs = {"token": token} if token else {}
     try:
         logger.info("Loading diarization pipeline %s …", DIARIZATION_MODEL)
-        try:
-            pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, **kwargs)
-        except TypeError:
-            # Older pyannote used use_auth_token=
-            pipeline = Pipeline.from_pretrained(
-                DIARIZATION_MODEL, use_auth_token=token or True
-            )
+        with _torch_load_compat_for_pyannote():
+            try:
+                pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, **kwargs)
+            except TypeError:
+                # Older pyannote used use_auth_token=
+                pipeline = Pipeline.from_pretrained(
+                    DIARIZATION_MODEL, use_auth_token=token or True
+                )
     except Exception as exc:
         raise RuntimeError(f"Failed to load {DIARIZATION_MODEL}.\n{gate_help}") from exc
     if pipeline is None:
