@@ -113,6 +113,38 @@ def _write_temp_wav(mono: np.ndarray, sample_rate: int) -> str:
     return path
 
 
+@contextmanager
+def _hf_hub_auth_compat():
+    """Old pyannote 3.x passes use_auth_token=; huggingface_hub>=0.34 only accepts token=."""
+    import huggingface_hub
+    import huggingface_hub.file_download as file_download
+
+    modules = [huggingface_hub, file_download]
+    originals: list[tuple[object, object]] = []
+
+    def _wrap(orig):
+        def wrapped(*args, **kwargs):
+            if "use_auth_token" in kwargs:
+                uat = kwargs.pop("use_auth_token")
+                if kwargs.get("token") is None:
+                    kwargs["token"] = uat
+            return orig(*args, **kwargs)
+
+        return wrapped
+
+    for mod in modules:
+        orig = getattr(mod, "hf_hub_download", None)
+        if orig is None:
+            continue
+        originals.append((mod, orig))
+        setattr(mod, "hf_hub_download", _wrap(orig))
+    try:
+        yield
+    finally:
+        for mod, orig in originals:
+            setattr(mod, "hf_hub_download", orig)
+
+
 def load_diarization_pipeline(device: str = "cuda"):
     """Load and cache pyannote speaker-diarization-3.1 (needs HF_TOKEN + model accept)."""
     try:
@@ -130,6 +162,11 @@ def load_diarization_pipeline(device: str = "cuda"):
             "HF_TOKEN not set — gated pyannote models will fail. "
             "export HF_TOKEN=... after accepting model cards."
         )
+    else:
+        # So downloads work even when from_pretrained gets no auth kwarg
+        os.environ.setdefault("HF_TOKEN", token)
+        os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", token)
+
     key = f"{DIARIZATION_MODEL}|{device}|{bool(token)}"
     if key in _pipeline_cache:
         return _pipeline_cache[key]
@@ -143,17 +180,27 @@ def load_diarization_pipeline(device: str = "cuda"):
         "Preferred fix: pip install 'pyannote.audio>=3.1,<4'"
     )
 
-    kwargs = {"token": token} if token else {}
     try:
         logger.info("Loading diarization pipeline %s …", DIARIZATION_MODEL)
-        with _torch_load_compat_for_pyannote():
-            try:
-                pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, **kwargs)
-            except TypeError:
-                # Older pyannote used use_auth_token=
-                pipeline = Pipeline.from_pretrained(
-                    DIARIZATION_MODEL, use_auth_token=token or True
-                )
+        with _torch_load_compat_for_pyannote(), _hf_hub_auth_compat():
+            pipeline = None
+            errors: list[str] = []
+            # Try modern (token=), legacy (use_auth_token=), then env-only.
+            attempts: list[dict] = []
+            if token:
+                attempts.append({"token": token})
+                attempts.append({"use_auth_token": token})
+            attempts.append({})
+            for kwargs in attempts:
+                try:
+                    pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, **kwargs)
+                    if pipeline is not None:
+                        break
+                except TypeError as exc:
+                    errors.append(f"{kwargs or 'env-only'}: {exc}")
+                    continue
+            if pipeline is None and errors:
+                raise RuntimeError("; ".join(errors))
     except Exception as exc:
         raise RuntimeError(
             f"Failed to load {DIARIZATION_MODEL}: {exc}\n{gate_help}"
