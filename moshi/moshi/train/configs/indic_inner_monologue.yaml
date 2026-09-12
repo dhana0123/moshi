@@ -1,0 +1,53 @@
+# Finetune Moshi on dual-channel Indic (or other) dialogues with Inner Monologue.
+# Dataset: python -m moshi.train.data.prepare --out data/moshi_im --dummy
+# Then set train_data to that jsonl.
+
+run_dir: runs/indic_inner_monologue
+overwrite_run_dir: false
+train_data: ""  # path/to/train.jsonl from moshi.train.data.prepare
+shuffle: true
+
+hf_repo: kyutai/moshiko-pytorch-bf16
+init: pretrained
+
+freeze:
+  mimi: true
+  lm.temporal: false
+  lm.depformer: false
+
+first_codebook_weight_multiplier: 100.0
+text_padding_weight: 0.5
+keep_main_only: true
+# Text 2 frames (160 ms) ahead of agent audio — paper Inner Monologue / TTS delay.
+audio_delay: 0.16
+text_mask_proba: 1.0
+hybrid_prompt: false
+audio_silence_seconds: 0.5
+voice_prompt_dir: null
+system_prompts:
+  - "You enjoy having a good conversation."
+hybrid_prompt_proba: 1.0
+
+duration_sec: 100
+batch_size: 1
+num_microbatches: 1
+max_steps: 100
+max_norm: 1.0
+gradient_checkpointing: true
+param_dtype: bfloat16
+seed: 0
+
+optim:
+  temporal_lr: 2.0e-6
+  depformer_lr: 2.0e-6
+  mimi_lr: 8.0e-4
+  weight_decay: 0.1
+  pct_start: 0.05
+
+log_freq: 1
+ckpt_freq: 50
+do_ckpt: true
+num_ckpt_keep: 3
+do_eval: false
+eval_data: ""
+eval_freq: 0

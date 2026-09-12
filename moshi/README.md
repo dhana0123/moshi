@@ -155,7 +155,19 @@ moshi-train --config path/to/default_7b.yaml
 Set `train_data` to a jsonl of `{"path": "file.wav", "duration": ...}` rows.
 Each wav needs a sibling `.json` with Whisper-style `alignments`:
 `[word, [start_sec, end_sec], speaker]`. Use stereo files (left = Moshi,
-right = user). Loading uses the same `CheckpointInfo` / `get_mimi` /
+right = user). There are **no** listen/speak control tokens: Inner Monologue
+is the agent text stream plus 8+8 Mimi codebooks (see
+`docs/inner_monologue_dataset.md` in the DUPLEX repo).
+
+```bash
+# dummy smoke
+python -m moshi.train.data.prepare --out ./data/moshi_im --dummy
+# IndicConformer + align (default), then private Hub upload
+python -m moshi.train.data.prepare --out ./data/moshi_im \
+  --stereo-dir /path/to/wavs --language hi --push-to-hub
+```
+
+Loading uses the same `CheckpointInfo` / `get_mimi` /
 `get_moshi` path as the server.
 
 Example freeze / swap in code:

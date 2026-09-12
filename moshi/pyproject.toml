@@ -28,6 +28,7 @@ moshi-inference = "moshi.run_inference:main"
 moshi-tts = "moshi.run_tts:main"
 moshi-train = "moshi.train.loop:main"
 moshi-train-eta = "moshi.train.bench_eta:main"
+moshi-prepare-data = "moshi.train.data.prepare:main"
 moshi-eval = "moshi.evaluate.evaluate:main"
 moshi-eval-bench = "moshi.evaluate.run_bench:main"
 
@@ -52,6 +53,13 @@ dev = [
 ]
 train = [
     "pyyaml >= 6.0",
+]
+# Dataset packer ASR (IndicConformer) + eval ASR share NeMo.
+data = [
+    "nemo_toolkit[asr]",
+    "torchaudio",
+    "datasets",
+    "soundfile",
 ]
 eval = [
     "torchaudio",
