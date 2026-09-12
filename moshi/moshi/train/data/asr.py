@@ -118,6 +118,7 @@ def load_indic_conformer(repo: str, device: str = "cuda"):
     if key in _conformer_cache:
         return _conformer_cache[key]
 
+    logger.info("Loading IndicConformer %s on %s …", repo, device)
     model = nemo_asr.models.ASRModel.from_pretrained(repo)
     if hasattr(model, "cur_decoder"):
         model.cur_decoder = "ctc"
@@ -129,6 +130,7 @@ def load_indic_conformer(repo: str, device: str = "cuda"):
         model = model.cpu()
         device = "cpu"
     _conformer_cache[key] = model
+    logger.info("IndicConformer ready: %s", repo)
     return model
 
 
@@ -190,6 +192,35 @@ def _extract_transcript(out) -> str:
     return str(out)
 
 
+_align_cache: dict[str, tuple[object, object]] = {}
+
+
+def load_whisperx_align_model(language: str, device: str = "cuda"):
+    """Download/cache WhisperX wav2vec2 aligner for ``language``."""
+    try:
+        import whisperx
+    except ImportError as exc:
+        raise AlignmentError(
+            "WhisperX is required for word timing. Install: pip install whisperx"
+        ) from exc
+
+    lang = language_id_for_nemo(language)
+    align_repo = whisperx_align_model_for_language(lang)
+    key = f"{lang}|{align_repo}|{device}"
+    if key in _align_cache:
+        return _align_cache[key][0], _align_cache[key][1], align_repo
+
+    logger.info("Loading WhisperX align model %s (lang=%s) …", align_repo, lang)
+    model_a, metadata = whisperx.load_align_model(
+        language_code=lang,
+        device=device,
+        model_name=align_repo,
+    )
+    _align_cache[key] = (model_a, metadata)
+    logger.info("WhisperX align ready: %s", align_repo)
+    return model_a, metadata, align_repo
+
+
 def align_words_whisperx(
     mono: np.ndarray,
     sample_rate: int,
@@ -211,17 +242,12 @@ def align_words_whisperx(
         return [], whisperx_align_model_for_language(language)
 
     lang = language_id_for_nemo(language)
-    align_repo = whisperx_align_model_for_language(lang)
+    model_a, metadata, align_repo = load_whisperx_align_model(lang, device=device)
     audio = resample_mono(mono, sample_rate, ASR_SAMPLE_RATE)
     duration = float(len(audio) / ASR_SAMPLE_RATE)
     segments = [{"start": 0.0, "end": duration, "text": transcript}]
 
     try:
-        model_a, metadata = whisperx.load_align_model(
-            language_code=lang,
-            device=device,
-            model_name=align_repo,
-        )
         aligned = whisperx.align(
             segments,
             model_a,

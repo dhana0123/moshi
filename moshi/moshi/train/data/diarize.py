@@ -72,6 +72,7 @@ def load_diarization_pipeline(device: str = "cuda"):
 
     kwargs = {"token": token} if token else {}
     try:
+        logger.info("Loading diarization pipeline %s …", DIARIZATION_MODEL)
         pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, **kwargs)
     except TypeError:
         # Older pyannote used use_auth_token=
@@ -87,6 +88,7 @@ def load_diarization_pipeline(device: str = "cuda"):
     else:
         pipeline.to(torch.device("cpu"))
     _pipeline_cache[key] = pipeline
+    logger.info("Diarization ready: %s", DIARIZATION_MODEL)
     return pipeline
 
 

@@ -48,6 +48,80 @@ CONVERSATION_MARKERS = (
 )
 
 
+def configure_logging(verbose: bool = False) -> None:
+    """Readable packer logs; keep Hugging Face HTTP noise quiet."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(message)s",
+        force=True,
+    )
+    # -v is for our stages, not urllib3/HF filelock spam
+    for name in (
+        "urllib3",
+        "urllib3.connectionpool",
+        "filelock",
+        "fsspec",
+        "fsspec.local",
+        "fsspec.http",
+        "huggingface_hub",
+        "huggingface_hub.file_download",
+        "huggingface_hub.utils",
+        "datasets",
+        "datasets.utils",
+        "datasets.utils.file_utils",
+        "httpx",
+        "httpcore",
+        "aiohttp",
+        "asyncio",
+        "multipart",
+        "nemo_logger",
+        "pytorch_lightning",
+        "lightning",
+        "transformers",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def warmup_models(
+    *,
+    languages: list[str],
+    asr_backend: str,
+    asr_model: str | None,
+    device: str,
+    diarize: bool,
+) -> None:
+    """Download / load Hub models once before packing any clip."""
+    logger.info("======== STEP 1/3  Prefetch models (wait for Hugging Face) ========")
+    if diarize:
+        from .diarize import DIARIZATION_MODEL, load_diarization_pipeline
+
+        logger.info("[1a] Diarization: %s", DIARIZATION_MODEL)
+        load_diarization_pipeline(device)
+        logger.info("[1a] Done.")
+
+    langs = sorted(set(languages))
+    if asr_backend == "indic-conformer":
+        from .asr import (
+            conformer_repo_for_language,
+            load_indic_conformer,
+            load_whisperx_align_model,
+            whisperx_align_model_for_language,
+        )
+
+        for lang in langs:
+            repo = asr_model or conformer_repo_for_language(lang)
+            logger.info("[1b] Transcript ASR: %s (lang=%s)", repo, lang)
+            load_indic_conformer(repo, device=device)
+            align_repo = whisperx_align_model_for_language(lang)
+            logger.info("[1c] Timer WhisperX: %s (lang=%s)", align_repo, lang)
+            load_whisperx_align_model(lang, device=device)
+            logger.info("[1b/1c] Done for lang=%s", lang)
+    elif asr_backend == "whisper":
+        logger.info("[1b] Whisper loads on first clip (%s)", asr_model or "large-v3")
+    logger.info("======== STEP 1/3  Models ready ========")
+
+
 @dataclass
 class PackedClip:
     wav_path: Path
@@ -276,11 +350,13 @@ def process_stereo_array(
     if x.shape[0] == 1:
         mono = x[0]
         if diarize:
+            logger.info("[%s] diarize mono → stereo (pyannote) …", name)
             try:
                 stereo = diarize_mono_to_stereo(mono, sr, device=asr_device)
                 stereo = pack_stereo(stereo[0], stereo[1], sr)
             except DiarizationSkip as exc:
                 raise DiarizationSkip(f"{name}: {exc}") from exc
+            logger.info("[%s] diarize ok", name)
         elif allow_silent_user:
             stereo = pack_stereo(mono, np.zeros_like(mono), sr)
         else:
@@ -295,6 +371,7 @@ def process_stereo_array(
     agent = stereo[0]
     provenance: dict | None = None
     if alignments is None:
+        logger.info("[%s] ASR (%s, lang=%s) + timer …", name, asr_backend, language)
         result = transcribe_agent_words(
             agent,
             SAMPLE_RATE,
@@ -305,6 +382,13 @@ def process_stereo_array(
         )
         words = result.words
         provenance = result.provenance_dict()
+        logger.info(
+            "[%s] ASR ok — %d words | transcript=%s | timer=%s",
+            name,
+            len(words),
+            provenance.get("transcript_model"),
+            provenance.get("timer_model"),
+        )
     else:
         words = alignments
         provenance = {
@@ -314,7 +398,7 @@ def process_stereo_array(
             "timer_model": "external",
             "language": language,
         }
-    return save_clip(
+    clip = save_clip(
         out_dir,
         name,
         stereo,
@@ -323,6 +407,8 @@ def process_stereo_array(
         text_delay_sec=text_delay_sec,
         provenance=provenance,
     )
+    logger.info("[%s] saved %s (%.2fs)", name, clip.wav_path.name, clip.duration)
+    return clip
 
 
 def _audio_column_name(features) -> str:
@@ -398,14 +484,39 @@ def process_indicvoices(
     ds = ds.cast_column(audio_col, Audio(decode=False))
     if streaming and hasattr(ds, "decode"):
         ds = ds.decode(False)
+    mode = "streaming" if streaming else "download"
+    logger.info(
+        "======== STEP 2/3  Scan IndicVoices [%s/%s] (%s) — looking for conversation rows ========",
+        language_config,
+        split,
+        mode,
+    )
+    if streaming:
+        logger.info(
+            "Streaming reads remote parquet shards; first conversation may take a while. "
+            "Progress logs every 50 rows."
+        )
     clips: list[PackedClip] = []
+    scanned = 0
+    skipped_non_conv = 0
     for i, row in enumerate(ds):
+        scanned += 1
+        if scanned == 1 or scanned % 50 == 0:
+            logger.info(
+                "[%s] scanned %d rows | conversation hits=%d | need=%s",
+                language_config,
+                scanned,
+                len(clips),
+                max_clips if max_clips is not None else "all",
+            )
         if not is_conversation_row(row):
+            skipped_non_conv += 1
             continue
         audio = row.get(audio_col) or row.get("audio_filepath") or row.get("audio")
         if audio is None:
             continue
         try:
+            logger.info("[%s] row %d is conversation — decode audio …", language_config, i)
             arr, sr = decode_hf_audio(audio)
         except Exception as err:
             logger.warning("Skip IndicVoices audio row %s: %s", i, err)
@@ -424,6 +535,13 @@ def process_indicvoices(
             continue
         if max_clips is not None and len(clips) >= max_clips:
             break
+    logger.info(
+        "[%s] done — packed %d | scanned %d | non-conversation %d",
+        language_config,
+        len(clips),
+        scanned,
+        skipped_non_conv,
+    )
     return clips
 
 
@@ -746,10 +864,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    configure_logging(verbose=args.verbose)
     text_delay_sec = args.text_delay_frames / MIMI_FRAME_RATE
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -838,6 +953,15 @@ def main(argv: list[str] | None = None) -> int:
         from .asr import AlignmentError
         from .diarize import DiarizationSkip
 
+        if not args.alignments_json:
+            warmup_models(
+                languages=[args.language or "hi"],
+                asr_backend=args.asr_backend,
+                asr_model=args.asr_model,
+                device=args.device,
+                diarize=args.diarize,
+            )
+        logger.info("======== STEP 2/3  Pack stereo-dir clips ========")
         n = 0
         for stem, wav, sr in iter_stereo_dir(args.stereo_dir):
             try:
@@ -859,6 +983,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.indicvoices:
         configs = parse_indicvoices_configs(args.indicvoices_config)
+        langs = [
+            asr_lang_for_indicvoices_config(c, args.language) for c in configs
+        ]
+        if not args.alignments_json:
+            warmup_models(
+                languages=langs,
+                asr_backend=args.asr_backend,
+                asr_model=args.asr_model,
+                device=args.device,
+                diarize=args.diarize,
+            )
+        logger.info("======== STEP 2/3  Pack conversation clips ========")
         iv = process_indicvoices_many(
             language_configs=configs,
             split=args.split,
@@ -888,6 +1024,7 @@ def main(argv: list[str] | None = None) -> int:
     print(jsonl_path)
 
     if args.push_to_hub:
+        logger.info("======== STEP 3/3  Push private dataset to Hugging Face ========")
         from .push import push_private_dataset
 
         push_private_dataset(
@@ -895,6 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
             hf_dataset=args.hf_dataset,
             include_tokens=bool(args.encode_mimi),
         )
+        logger.info("======== STEP 3/3  Push done ========")
     return 0
 
 
