@@ -60,14 +60,16 @@ train = [
 # If torch/torchaudio got replaced, reinstall your CUDA wheels AFTER.
 data = [
     # Hub / I/O  (torch/torchaudio already required by moshi core — do not re-pin here)
-    "datasets>=2.19",
+    # pyarrow>=21 removed PyExtensionType; older datasets still need it
+    "pyarrow>=14,<21",
+    "datasets>=2.19,<4.0",
     "huggingface-hub>=0.24",
     "soundfile>=0.12",
     "scipy>=1.11",
     "pandas>=2.0",
     # Diarization (mono → stereo). Pin <4 so 3.1 pipeline does not pull gated community-1 PLDA.
     "pyannote.audio>=3.1.0,<4.0",
-    # Agent ASR (IndicConformer CTC)
+    # Agent ASR: prefer AI4Bharat/NeMo nemo-v2 for IndicConformer; stock nemo may KeyError 'dir'
     "nemo_toolkit[asr]",
     "omegaconf",
     "hydra-core",

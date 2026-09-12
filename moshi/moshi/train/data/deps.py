@@ -12,13 +12,14 @@ logger = logging.getLogger("moshi.prepare.deps")
 
 # (import_name, pip_extra_hint)
 _REQUIRED: list[tuple[str, str]] = [
-    ("datasets", "datasets"),
+    ("datasets", "datasets>=2.19,<4.0"),
+    ("pyarrow", "pyarrow>=14,<21"),
     ("soundfile", "soundfile"),
     ("huggingface_hub", "huggingface-hub"),
     ("scipy", "scipy"),
     ("pandas", "pandas"),
-    ("pyannote.audio", "pyannote.audio>=3.1"),
-    ("nemo.collections.asr", "nemo_toolkit[asr]"),
+    ("pyannote.audio", "pyannote.audio>=3.1,<4"),
+    ("nemo.collections.asr", "nemo_toolkit[asr] or AI4Bharat/NeMo nemo-v2"),
     ("torchaudio", "torchaudio"),
     ("whisperx", "whisperx"),
     ("transformers", "transformers"),
@@ -27,32 +28,38 @@ _REQUIRED: list[tuple[str, str]] = [
 
 def missing_data_packages(*, diarize: bool = True, asr_backend: str = "indic-conformer") -> list[str]:
     missing: list[str] = []
+    broken: list[str] = []
     for mod, pip_name in _REQUIRED:
         if mod == "pyannote.audio" and not diarize:
             continue
         if mod.startswith("nemo") and asr_backend != "indic-conformer":
             continue
-        if mod == "whisperx" and asr_backend != "indic-conformer":
-            continue
+        if mod == "whisperx" and asr_backend not in {"indic-conformer", "whisper"}:
+            # whisperx only required for indic-conformer timing; whisper backend has own times
+            if asr_backend != "indic-conformer":
+                continue
         try:
             importlib.import_module(mod)
         except ImportError:
             missing.append(pip_name)
-    return missing
+        except Exception as exc:
+            broken.append(f"{pip_name} ({type(exc).__name__}: {exc})")
+    return missing + broken
 
 
 def require_data_deps(*, diarize: bool = True, asr_backend: str = "indic-conformer") -> None:
-    missing = missing_data_packages(diarize=diarize, asr_backend=asr_backend)
-    if not missing:
+    problems = missing_data_packages(diarize=diarize, asr_backend=asr_backend)
+    if not problems:
         logger.info("Data deps OK (%d packages checked).", len(_REQUIRED))
         return
-    uniq = sorted(set(missing))
+    uniq = sorted(set(problems))
     raise ImportError(
-        "Missing packer dependencies: "
-        + ", ".join(uniq)
-        + "\n\nInstall everything with:\n"
-        "  cd moshi/moshi && pip install -e \".[data]\"\n"
-        "or:\n"
+        "Missing or broken packer dependencies:\n  - "
+        + "\n  - ".join(uniq)
+        + "\n\nFix common pyarrow/datasets clash:\n"
+        "  pip install 'pyarrow>=14,<21' 'datasets>=2.19,<4.0'\n\n"
+        "Or install extras:\n"
+        "  cd moshi/moshi && pip install -e \".[data]\" --upgrade-strategy only-if-needed\n"
         "  pip install -r requirements-data.txt\n"
         "then re-run prepare."
     )

@@ -14,8 +14,14 @@
 #   https://huggingface.co/pyannote/speaker-diarization-3.1
 #   https://huggingface.co/pyannote/segmentation-3.0
 # Prefer pyannote.audio 3.x (<4) so community-1 is not required.
+#
+# IndicConformer needs AI4Bharat NeMo (nemo-v2), not only stock nemo_toolkit:
+#   git clone https://github.com/AI4Bharat/NeMo.git && cd NeMo && git checkout nemo-v2
+#   pip install -e '.[asr]' --upgrade-strategy only-if-needed
 
-datasets>=2.19
+# datasets + pyarrow must match (pyarrow 21+ dropped PyExtensionType)
+pyarrow>=14,<21
+datasets>=2.19,<4.0
 huggingface-hub>=0.24
 soundfile>=0.12
 scipy>=1.11

@@ -145,14 +145,33 @@ def download_nemo_checkpoint(repo: str) -> Path:
     return Path(path)
 
 
+AI4BHARAT_NEMO_HELP = """
+IndicConformer .nemo files need AI4Bharat's NeMo fork (not stock NVIDIA NeMo).
+Stock NeMo fails with: KeyError: 'dir' (tokenizer).
+
+Install on the GPU box (keep your CUDA torch afterward):
+
+  cd ~
+  git clone https://github.com/AI4Bharat/NeMo.git
+  cd NeMo && git checkout nemo-v2
+  pip install -e '.[asr]' --upgrade-strategy only-if-needed
+  # if torch got replaced:
+  pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+Then re-run prepare with --asr-backend indic-conformer.
+
+Smoke test without IndicConformer (uses Whisper text+times):
+  python -m moshi.train.data.prepare ... --asr-backend whisper
+""".strip()
+
+
 def load_indic_conformer(repo: str, device: str = "cuda"):
     try:
         import nemo.collections.asr as nemo_asr
         import torch
     except ImportError as exc:
         raise ImportError(
-            "IndicConformer needs nemo_toolkit[asr]. "
-            "Install: pip install 'nemo_toolkit[asr]' (or moshi[data])."
+            "IndicConformer needs NeMo ASR.\n" + AI4BHARAT_NEMO_HELP
         ) from exc
 
     key = f"{repo}|{device}"
@@ -160,24 +179,45 @@ def load_indic_conformer(repo: str, device: str = "cuda"):
         return _conformer_cache[key]
 
     logger.info("Loading IndicConformer %s on %s …", repo, device)
-    # NeMo 3 from_pretrained expects model_config.yaml; AI4Bharat HF repos only
-    # ship a .nemo archive — download it and restore_from.
+    # AI4Bharat HF repos ship a single .nemo archive (not extracted yaml).
     nemo_path = download_nemo_checkpoint(repo)
-    map_location = None
-    if device.startswith("cuda") and torch.cuda.is_available():
-        map_location = torch.device(device)
+    map_location = "cuda" if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
+
+    # Prefer the hybrid class these checkpoints use (stock ASRModel.restore_from is fragile).
+    Hybrid = getattr(nemo_asr.models, "EncDecHybridRNNTCTCBPEModel", None)
+    restore_cls = Hybrid or nemo_asr.models.ASRModel
+
     try:
-        model = nemo_asr.models.ASRModel.restore_from(
-            restore_path=str(nemo_path),
-            map_location=map_location,
-        )
-    except TypeError:
-        model = nemo_asr.models.ASRModel.restore_from(str(nemo_path))
+        try:
+            model = restore_cls.restore_from(
+                restore_path=str(nemo_path),
+                map_location=map_location,
+            )
+        except TypeError:
+            model = restore_cls.restore_from(str(nemo_path))
+    except KeyError as exc:
+        if str(exc).strip("'\"") == "dir" or "dir" in str(exc):
+            raise RuntimeError(
+                f"Failed to load {repo} with this NeMo install (tokenizer KeyError 'dir').\n"
+                + AI4BHARAT_NEMO_HELP
+            ) from exc
+        raise
+    except Exception as exc:
+        msg = str(exc)
+        if "dir" in msg or "tokenizer" in msg.lower():
+            raise RuntimeError(
+                f"Failed to load {repo}: {exc}\n" + AI4BHARAT_NEMO_HELP
+            ) from exc
+        raise RuntimeError(
+            f"Failed to load IndicConformer {repo} from {nemo_path}: {exc}\n"
+            + AI4BHARAT_NEMO_HELP
+        ) from exc
+
     if hasattr(model, "cur_decoder"):
         model.cur_decoder = "ctc"
     model.freeze()
     model.eval()
-    if device.startswith("cuda") and torch.cuda.is_available():
+    if map_location == "cuda":
         model = model.to(torch.device(device))
     else:
         model = model.cpu()
