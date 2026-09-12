@@ -31,6 +31,13 @@ from .inner_monologue import AGENT_SPEAKER, MIMI_FRAME_RATE
 logger = logging.getLogger("moshi.prepare")
 
 SAMPLE_RATE = 24_000
+INDICVOICES_FOCUS = ("hindi", "telugu", "kannada", "tamil")
+INDICVOICES_CONFIG_TO_LANG = {
+    "hindi": "hi",
+    "telugu": "te",
+    "kannada": "kn",
+    "tamil": "ta",
+}
 CONVERSATION_MARKERS = (
     "conversation",
     "conversational",
@@ -126,9 +133,10 @@ def alignments_payload(
     *,
     speaker: str = AGENT_SPEAKER,
     text_delay_sec: float = 0.0,
+    provenance: dict | None = None,
 ) -> dict:
-    """Sidecar JSON with acoustic word times. Text delay is a train-time shift."""
-    return {
+    """Sidecar JSON with acoustic word times + ASR/timer model labels."""
+    payload = {
         "alignments": [
             [w, [float(s), float(e)], speaker] for w, (s, e) in words
         ],
@@ -140,6 +148,9 @@ def alignments_payload(
             "control_tokens": False,
         },
     }
+    if provenance:
+        payload["extraction"] = provenance
+    return payload
 
 
 def write_sidecar(path: Path, payload: dict) -> None:
@@ -147,9 +158,17 @@ def write_sidecar(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def append_jsonl(jsonl_path: Path, wav_path: Path, duration: float) -> None:
+def append_jsonl(
+    jsonl_path: Path,
+    wav_path: Path,
+    duration: float,
+    *,
+    provenance: dict | None = None,
+) -> None:
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    rec = {"path": str(wav_path.resolve()), "duration": float(duration)}
+    rec: dict = {"path": str(wav_path.resolve()), "duration": float(duration)}
+    if provenance:
+        rec["extraction"] = provenance
     with jsonl_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
@@ -157,6 +176,20 @@ def append_jsonl(jsonl_path: Path, wav_path: Path, duration: float) -> None:
 def is_conversation_row(row: dict) -> bool:
     blob = f"{row.get('task_name', '')} {row.get('scenario', '')}".lower()
     return any(m in blob for m in CONVERSATION_MARKERS)
+
+
+def parse_indicvoices_configs(raw: str | None) -> list[str]:
+    """Comma-separated HF config names; default = hindi,telugu,kannada,tamil."""
+    if not raw or not str(raw).strip():
+        return list(INDICVOICES_FOCUS)
+    configs = [c.strip().lower() for c in str(raw).split(",") if c.strip()]
+    return configs or list(INDICVOICES_FOCUS)
+
+
+def asr_lang_for_indicvoices_config(config: str, language_override: str | None) -> str:
+    if language_override:
+        return language_override
+    return INDICVOICES_CONFIG_TO_LANG.get(config.lower(), "hi")
 
 
 def load_alignments_json(path: Path) -> list[tuple[str, tuple[float, float]]]:
@@ -183,13 +216,17 @@ def save_clip(
     *,
     text_delay_sec: float,
     sample_rate: int = SAMPLE_RATE,
+    provenance: dict | None = None,
 ) -> PackedClip:
     wav_path = out_dir / "wav" / f"{stem}.wav"
     json_path = out_dir / "wav" / f"{stem}.json"
     write_pcm16_wav(wav_path, stereo, sample_rate)
     duration = stereo.shape[-1] / sample_rate
-    write_sidecar(json_path, alignments_payload(words, text_delay_sec=text_delay_sec))
-    append_jsonl(jsonl_path, wav_path, duration)
+    write_sidecar(
+        json_path,
+        alignments_payload(words, text_delay_sec=text_delay_sec, provenance=provenance),
+    )
+    append_jsonl(jsonl_path, wav_path, duration, provenance=provenance)
     return PackedClip(wav_path, json_path, duration, len(words))
 
 
@@ -223,11 +260,13 @@ def process_stereo_array(
     agent_channel: int,
     user_channel: int,
     allow_silent_user: bool,
+    diarize: bool,
     text_delay_sec: float,
     out_dir: Path,
     jsonl_path: Path,
 ) -> PackedClip:
     from .asr import transcribe_agent_words
+    from .diarize import DiarizationSkip, diarize_mono_to_stereo
 
     x = np.asarray(wav, dtype=np.float32)
     if x.ndim == 2 and x.shape[0] not in (1, 2) and x.shape[1] in (1, 2):
@@ -235,19 +274,28 @@ def process_stereo_array(
     if x.ndim == 1:
         x = x[None]
     if x.shape[0] == 1:
-        if not allow_silent_user:
+        mono = x[0]
+        if diarize:
+            try:
+                stereo = diarize_mono_to_stereo(mono, sr, device=asr_device)
+                stereo = pack_stereo(stereo[0], stereo[1], sr)
+            except DiarizationSkip as exc:
+                raise DiarizationSkip(f"{name}: {exc}") from exc
+        elif allow_silent_user:
+            stereo = pack_stereo(mono, np.zeros_like(mono), sr)
+        else:
             raise ValueError(
-                f"{name}: mono file. Pass --allow-silent-user for single-stream "
-                "pretrain format, or provide stereo / dual-mono."
+                f"{name}: mono file. Use --diarize (default) for 2-speaker gating, "
+                "or --allow-silent-user / provide stereo."
             )
-        stereo = pack_stereo(x[0], np.zeros_like(x[0]), sr)
     else:
         if agent_channel >= x.shape[0] or user_channel >= x.shape[0]:
             raise ValueError(f"{name}: not enough channels ({x.shape[0]})")
         stereo = pack_stereo(x[agent_channel], x[user_channel], sr)
     agent = stereo[0]
+    provenance: dict | None = None
     if alignments is None:
-        words = transcribe_agent_words(
+        result = transcribe_agent_words(
             agent,
             SAMPLE_RATE,
             language=language,
@@ -255,9 +303,26 @@ def process_stereo_array(
             asr_model=asr_model,
             device=asr_device,
         )
+        words = result.words
+        provenance = result.provenance_dict()
     else:
         words = alignments
-    return save_clip(out_dir, name, stereo, words, jsonl_path, text_delay_sec=text_delay_sec)
+        provenance = {
+            "transcript_backend": "alignments-json",
+            "transcript_model": "external",
+            "timer_backend": "alignments-json",
+            "timer_model": "external",
+            "language": language,
+        }
+    return save_clip(
+        out_dir,
+        name,
+        stereo,
+        words,
+        jsonl_path,
+        text_delay_sec=text_delay_sec,
+        provenance=provenance,
+    )
 
 
 def process_indicvoices(
@@ -291,28 +356,204 @@ def process_indicvoices(
         stem = f"{language_config}_{split}_{i:08d}"
         try:
             clips.append(process_stereo_array(stem, arr, sr, alignments=None, **kwargs))
-        except Exception:
-            logger.exception("Failed IndicVoices row %s", stem)
+        except Exception as err:
+            from .asr import AlignmentError
+            from .diarize import DiarizationSkip
+
+            if isinstance(err, (DiarizationSkip, AlignmentError)):
+                logger.warning("Skip %s: %s", stem, err)
+            else:
+                logger.exception("Failed IndicVoices row %s", stem)
             continue
         if max_clips is not None and len(clips) >= max_clips:
             break
     return clips
 
 
-def make_dummy_dialogue(duration_sec: float = 2.56, sr: int = SAMPLE_RATE) -> tuple[np.ndarray, list[tuple[str, tuple[float, float]]]]:
+def process_indicvoices_many(
+    *,
+    language_configs: list[str],
+    split: str,
+    max_clips_per_lang: int | None,
+    streaming: bool,
+    language_override: str | None,
+    common: dict,
+) -> list[PackedClip]:
+    """Pack conversational rows for each IndicVoices config (default: 4 focus langs)."""
+    all_clips: list[PackedClip] = []
+    for config in language_configs:
+        lang = asr_lang_for_indicvoices_config(config, language_override)
+        kwargs = {**common, "language": lang}
+        logger.info(
+            "IndicVoices config=%s asr_lang=%s max_clips_per_lang=%s",
+            config,
+            lang,
+            max_clips_per_lang,
+        )
+        part = process_indicvoices(
+            language_config=config,
+            split=split,
+            max_clips=max_clips_per_lang,
+            streaming=streaming,
+            **kwargs,
+        )
+        logger.info("Packed %d conversation rows from %s", len(part), config)
+        all_clips.extend(part)
+    return all_clips
+
+
+def make_dummy_dialogue(
+    duration_sec: float = 2.56,
+    sr: int = SAMPLE_RATE,
+) -> tuple[np.ndarray, list[tuple[str, tuple[float, float]]]]:
     """Deterministic dual-channel clip for pipeline tests (agent then overlap)."""
-    t = np.arange(int(duration_sec * sr), dtype=np.float32) / sr
-    agent = 0.08 * np.sin(2 * np.pi * 220 * t)
-    user = 0.08 * np.sin(2 * np.pi * 330 * t)
-    # Agent talks 0.2–1.2 s; user 0.9–2.0 s (natural overlap, no state token).
-    agent_gate = ((t >= 0.2) & (t < 1.2)).astype(np.float32)
-    user_gate = ((t >= 0.9) & (t < 2.0)).astype(np.float32)
-    stereo = np.stack([agent * agent_gate, user * user_gate], axis=0)
-    words = [
-        ("hello", (0.20, 0.55)),
-        ("there", (0.58, 1.10)),
-    ]
+    del duration_sec  # first sample is fixed-length overlap
+    _stem, stereo, words, _desc = make_sample_dialogues(sr=sr)[0]
     return stereo, words
+
+
+def make_sample_dialogues(
+    sr: int = SAMPLE_RATE,
+) -> list[tuple[str, np.ndarray, list[tuple[str, tuple[float, float]]], str]]:
+    """Three short inspectable clips: overlap, pause, agent-only turn.
+
+    Each item: ``(stem, stereo[C,T], words, description)``.
+    """
+
+    def _tone(freq: float, t: np.ndarray, gate: np.ndarray) -> np.ndarray:
+        return (0.1 * np.sin(2 * np.pi * freq * t) * gate).astype(np.float32)
+
+    samples: list[tuple[str, np.ndarray, list[tuple[str, tuple[float, float]]], str]] = []
+
+    # 1) Overlap: agent then user barge-in
+    dur = 2.56
+    t = np.arange(int(dur * sr), dtype=np.float32) / sr
+    agent = _tone(220.0, t, ((t >= 0.2) & (t < 1.2)).astype(np.float32))
+    user = _tone(330.0, t, ((t >= 0.9) & (t < 2.0)).astype(np.float32))
+    samples.append(
+        (
+            "01_overlap",
+            np.stack([agent, user], axis=0),
+            [("hello", (0.20, 0.55)), ("there", (0.58, 1.10))],
+            "Agent speaks, user overlaps mid-turn (no control tokens).",
+        )
+    )
+
+    # 2) Pause: agent, silence, agent continues; user quiet
+    dur = 3.2
+    t = np.arange(int(dur * sr), dtype=np.float32) / sr
+    agent = _tone(
+        240.0,
+        t,
+        (((t >= 0.15) & (t < 0.9)) | ((t >= 2.0) & (t < 2.8))).astype(np.float32),
+    )
+    user = np.zeros_like(t)
+    samples.append(
+        (
+            "02_pause",
+            np.stack([agent, user], axis=0),
+            [
+                ("namaste", (0.15, 0.55)),
+                ("ji", (0.58, 0.85)),
+                ("kaise", (2.00, 2.35)),
+                ("hain", (2.40, 2.75)),
+            ],
+            "Agent pauses ~1.1s then continues; user channel is silence.",
+        )
+    )
+
+    # 3) Backchannel-ish: user long turn, short agent filler
+    dur = 3.0
+    t = np.arange(int(dur * sr), dtype=np.float32) / sr
+    user = _tone(300.0, t, ((t >= 0.1) & (t < 2.6)).astype(np.float32))
+    agent = _tone(260.0, t, ((t >= 1.2) & (t < 1.55)).astype(np.float32))
+    samples.append(
+        (
+            "03_backchannel",
+            np.stack([agent, user], axis=0),
+            [("haan", (1.20, 1.50))],
+            "User talks continuously; agent short haan (backchannel).",
+        )
+    )
+    return samples
+
+
+def write_inspect_samples(out_dir: Path, *, text_delay_sec: float = 0.16) -> list[PackedClip]:
+    """Write three sample clips + README for local download/inspect."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = out_dir / "train.jsonl"
+    if jsonl_path.exists():
+        jsonl_path.unlink()
+    synth_provenance = {
+        "transcript_backend": "synthetic",
+        "transcript_model": "none",
+        "timer_backend": "synthetic",
+        "timer_model": "none",
+        "language": "hi",
+        "transcript_text": "",
+    }
+    clips: list[PackedClip] = []
+    lines = [
+        "# Moshi Inner Monologue — 3 inspect samples",
+        "",
+        "Synthetic stereo tones (not real speech) so you can check **layout** without ASR.",
+        "",
+        "| File | Scenario |",
+        "|------|----------|",
+    ]
+    for stem, stereo, words, desc in make_sample_dialogues():
+        clip = save_clip(
+            out_dir,
+            stem,
+            stereo,
+            words,
+            jsonl_path,
+            text_delay_sec=text_delay_sec,
+            provenance=synth_provenance,
+        )
+        clips.append(clip)
+        lines.append(f"| `wav/{stem}.wav` + `.json` | {desc} |")
+    lines.extend(
+        [
+            "",
+            "## Layout",
+            "",
+            "- **Left channel** = agent (Moshi)",
+            "- **Right channel** = user",
+            "- `*.json` = agent word alignments only (`SPEAKER_MAIN`)",
+            "- `train.jsonl` = `{\"path\", \"duration\", \"extraction\"}`",
+            "",
+            "Open the wav in any editor that shows stereo; open the sibling JSON for times.",
+            "",
+        ]
+    )
+    (out_dir / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    meta = {
+        "sample_rate": SAMPLE_RATE,
+        "mimi_frame_rate_hz": MIMI_FRAME_RATE,
+        "text_delay_sec": text_delay_sec,
+        "streams": 17,
+        "layout": ["W_agent_text", "A_agent_8", "A_user_8"],
+        "control_tokens": False,
+        "synthetic_tones": True,
+        "n_clips": len(clips),
+    }
+    (out_dir / "dataset_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    # Portable paths inside the folder / zip
+    rows = []
+    for clip in clips:
+        rows.append(
+            {
+                "path": f"wav/{clip.wav_path.name}",
+                "duration": clip.duration,
+                "extraction": synth_provenance,
+            }
+        )
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for rec in rows:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return clips
 
 
 def maybe_encode_mimi(
@@ -376,12 +617,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, required=True, help="Output directory.")
     parser.add_argument("--stereo-dir", type=Path, default=None, help="Folder of wavs (stereo preferred).")
     parser.add_argument("--indicvoices", action="store_true", help="Pull conversational rows from IndicVoices.")
-    parser.add_argument("--indicvoices-config", default="hindi", help="HF config name, e.g. hindi.")
+    parser.add_argument(
+        "--indicvoices-config",
+        default=",".join(INDICVOICES_FOCUS),
+        help="Comma-separated HF configs (default: hindi,telugu,kannada,tamil).",
+    )
     parser.add_argument("--split", default="train")
     parser.add_argument("--streaming", action="store_true")
-    parser.add_argument("--max-clips", type=int, default=None)
+    parser.add_argument(
+        "--max-clips",
+        type=int,
+        default=None,
+        help="Optional per-language cap for smoke tests. Default: no limit (all conversation rows).",
+    )
     parser.add_argument("--dummy", action="store_true", help="Write one synthetic clip (no ASR).")
-    parser.add_argument("--language", default="hi", help="ASR language code.")
+    parser.add_argument(
+        "--samples",
+        action="store_true",
+        help="Write 3 inspectable synthetic clips (overlap / pause / backchannel).",
+    )
+    parser.add_argument(
+        "--language",
+        default=None,
+        help="ASR language override (e.g. hi). Default: derive from each IndicVoices config.",
+    )
     parser.add_argument(
         "--asr-backend",
         default="indic-conformer",
@@ -399,7 +658,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--allow-silent-user",
         action="store_true",
-        help="Mono → agent + silence (single-stream pretrain, paper §4.2).",
+        help="Mono without diarize → agent + silence (legacy single-stream).",
+    )
+    parser.add_argument(
+        "--diarize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Mono → pyannote 2-speaker gate to stereo (default: on). Use --no-diarize to disable.",
     )
     parser.add_argument(
         "--text-delay-frames",
@@ -412,8 +677,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", default="cuda", help="Device for ASR / Mimi encode.")
     parser.add_argument(
         "--push-to-hub",
-        action="store_true",
-        help="Upload out/ to a private HF dataset (HF_TOKEN / huggingface-cli login).",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Upload out/ to a private HF dataset (default: on). Use --no-push-to-hub to skip.",
     )
     parser.add_argument(
         "--hf-dataset",
@@ -430,6 +696,26 @@ def main(argv: list[str] | None = None) -> int:
     text_delay_sec = args.text_delay_frames / MIMI_FRAME_RATE
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.samples:
+        clips = write_inspect_samples(out_dir, text_delay_sec=text_delay_sec)
+        logger.info("Wrote %d inspect samples under %s", len(clips), out_dir)
+        # Zip for easy download
+        import zipfile
+
+        zip_path = out_dir / "moshi_im_samples.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in sorted(out_dir.rglob("*")):
+                if p.is_file() and p.name != zip_path.name:
+                    zf.write(p, p.relative_to(out_dir).as_posix())
+        logger.info("Zip: %s", zip_path)
+        print(zip_path)
+        if args.push_to_hub:
+            from .push import push_private_dataset
+
+            push_private_dataset(out_dir, hf_dataset=args.hf_dataset, include_tokens=False)
+        return 0
+
     jsonl_path = out_dir / "train.jsonl"
     if jsonl_path.exists():
         jsonl_path.unlink()
@@ -445,18 +731,24 @@ def main(argv: list[str] | None = None) -> int:
         "inner_monologue_user_text": False,
         "asr_backend": args.asr_backend,
         "language": args.language,
+        "indicvoices_configs": parse_indicvoices_configs(args.indicvoices_config)
+        if args.indicvoices
+        else [],
+        "max_clips_per_lang": args.max_clips,
+        "diarize": args.diarize,
     }
     (out_dir / "dataset_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     clips: list[PackedClip] = []
     common = dict(
-        language=args.language,
+        language=args.language or "hi",
         asr_backend=args.asr_backend,
         asr_model=args.asr_model,
         asr_device=args.device,
         agent_channel=args.agent_channel,
         user_channel=args.user_channel,
         allow_silent_user=args.allow_silent_user,
+        diarize=args.diarize,
         text_delay_sec=text_delay_sec,
         out_dir=out_dir,
         jsonl_path=jsonl_path,
@@ -465,21 +757,43 @@ def main(argv: list[str] | None = None) -> int:
     if args.dummy:
         stereo, words = make_dummy_dialogue()
         clips.append(
-            save_clip(out_dir, "dummy_dialogue", stereo, words, jsonl_path, text_delay_sec=text_delay_sec)
+            save_clip(
+                out_dir,
+                "dummy_dialogue",
+                stereo,
+                words,
+                jsonl_path,
+                text_delay_sec=text_delay_sec,
+                provenance={
+                    "transcript_backend": "synthetic",
+                    "transcript_model": "none",
+                    "timer_backend": "synthetic",
+                    "timer_model": "none",
+                    "language": "hi",
+                    "transcript_text": "",
+                },
+            )
         )
 
     extra_align = load_alignments_json(args.alignments_json) if args.alignments_json else None
 
     if args.stereo_dir:
+        from .asr import AlignmentError
+        from .diarize import DiarizationSkip
+
         n = 0
         for stem, wav, sr in iter_stereo_dir(args.stereo_dir):
-            clip = process_stereo_array(
-                stem,
-                wav,
-                sr,
-                alignments=extra_align,
-                **common,
-            )
+            try:
+                clip = process_stereo_array(
+                    stem,
+                    wav,
+                    sr,
+                    alignments=extra_align,
+                    **common,
+                )
+            except (DiarizationSkip, AlignmentError) as err:
+                logger.warning("Skip %s: %s", stem, err)
+                continue
             clips.append(clip)
             n += 1
             if args.max_clips is not None and n >= args.max_clips:
@@ -487,15 +801,21 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("Packed %d files from %s", n, args.stereo_dir)
 
     if args.indicvoices:
-        iv = process_indicvoices(
-            language_config=args.indicvoices_config,
+        configs = parse_indicvoices_configs(args.indicvoices_config)
+        iv = process_indicvoices_many(
+            language_configs=configs,
             split=args.split,
-            max_clips=args.max_clips,
+            max_clips_per_lang=args.max_clips,
             streaming=args.streaming,
-            **common,
+            language_override=args.language,
+            common=common,
         )
         clips.extend(iv)
-        logger.info("Packed %d IndicVoices conversation rows", len(iv))
+        logger.info(
+            "Packed %d IndicVoices conversation rows total across %s",
+            len(iv),
+            ",".join(configs),
+        )
 
     if not clips:
         raise SystemExit("Nothing written. Pass --dummy, --stereo-dir, or --indicvoices.")

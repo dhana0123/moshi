@@ -13,9 +13,14 @@ from moshi.train.data.inner_monologue import (
 from moshi.train.data.interleaver import Interleaver
 from moshi.train.data.prepare import (
     alignments_payload,
+    asr_lang_for_indicvoices_config,
     make_dummy_dialogue,
+    make_sample_dialogues,
     pack_stereo,
+    parse_indicvoices_configs,
     save_clip,
+    write_inspect_samples,
+    INDICVOICES_FOCUS,
 )
 from moshi.train.data import prepare as prepare_mod
 from moshi.train.data import asr as asr_mod
@@ -98,7 +103,7 @@ def test_interleaver_epad_on_dummy_words():
 
 
 def test_prepare_dummy_cli(tmp_path: Path):
-    code = prepare_mod.main(["--out", str(tmp_path / "im"), "--dummy"])
+    code = prepare_mod.main(["--out", str(tmp_path / "im"), "--dummy", "--no-push-to-hub"])
     assert code == 0
     jsonl = tmp_path / "im" / "train.jsonl"
     meta = json.loads((tmp_path / "im" / "dataset_meta.json").read_text(encoding="utf-8"))
@@ -109,35 +114,110 @@ def test_prepare_dummy_cli(tmp_path: Path):
     assert meta["asr_backend"] == "indic-conformer"
 
 
-def test_alignments_payload_no_user_text():
-    payload = alignments_payload([("ok", (0.0, 0.2))])
+def test_alignments_payload_includes_extraction():
+    payload = alignments_payload(
+        [("ok", (0.0, 0.2))],
+        provenance={
+            "transcript_backend": "indic-conformer",
+            "transcript_model": "m",
+            "timer_backend": "whisperx",
+            "timer_model": "t",
+            "language": "hi",
+        },
+    )
+    assert payload["extraction"]["timer_backend"] == "whisperx"
     assert payload["inner_monologue"]["user_text"] is False
 
 
-def test_even_word_spans_and_split():
+def test_indicvoices_focus_configs_and_asr_lang():
+    assert parse_indicvoices_configs(None) == list(INDICVOICES_FOCUS)
+    assert parse_indicvoices_configs("") == list(INDICVOICES_FOCUS)
+    assert parse_indicvoices_configs("hindi,tamil") == ["hindi", "tamil"]
+    assert asr_lang_for_indicvoices_config("telugu", None) == "te"
+    assert asr_lang_for_indicvoices_config("kannada", None) == "kn"
+    assert asr_lang_for_indicvoices_config("tamil", "xx") == "xx"
+
+
+def test_diarize_gate_and_skip():
+    from moshi.train.data.diarize import (
+        DiarizationResult,
+        DiarizationSkip,
+        mono_to_stereo_from_diarization,
+        pick_agent_user,
+        validate_two_speakers,
+    )
+
+    validate_two_speakers({"A": 1.0, "B": 0.8})
+    try:
+        validate_two_speakers({"A": 1.0, "B": 0.1})
+        assert False, "expected DiarizationSkip"
+    except DiarizationSkip:
+        pass
+    agent, user = pick_agent_user({"SPEAKER_00": 0.5, "SPEAKER_01": 2.0})
+    assert agent == "SPEAKER_01"
+    assert user == "SPEAKER_00"
+
+    sr = 1000
+    mono = np.ones(3000, dtype=np.float32)
+    result = DiarizationResult(
+        turns=[
+            ("SPEAKER_01", 0.0, 1.5),
+            ("SPEAKER_00", 1.5, 3.0),
+        ],
+        agent_id="SPEAKER_01",
+        user_id="SPEAKER_00",
+        durations={"SPEAKER_01": 1.5, "SPEAKER_00": 1.5},
+    )
+    stereo = mono_to_stereo_from_diarization(mono, sr, result)
+    assert stereo.shape == (2, 3000)
+    assert float(stereo[0, 100]) == 1.0 and float(stereo[1, 100]) == 0.0
+    assert float(stereo[0, 2000]) == 0.0 and float(stereo[1, 2000]) == 1.0
+
+
+def test_write_three_inspect_samples(tmp_path: Path):
+    clips = write_inspect_samples(tmp_path / "samples", text_delay_sec=0.16)
+    assert len(clips) == 3
+    assert len(make_sample_dialogues()) == 3
+    jsonl = (tmp_path / "samples" / "train.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(jsonl) == 3
+    assert json.loads(jsonl[0])["path"].startswith("wav/")
+    assert (tmp_path / "samples" / "wav" / "01_overlap.wav").exists()
+    assert (tmp_path / "samples" / "wav" / "03_backchannel.json").exists()
+
+
+def test_whisperx_align_model_map_and_split():
     assert asr_mod.split_words("  namaste  bhai ") == ["namaste", "bhai"]
-    spans = asr_mod._even_word_spans(["a", "b"], 1.0)
-    assert spans[0] == ("a", (0.0, 0.5))
-    assert spans[1] == ("b", (0.5, 1.0))
+    assert "hi" in asr_mod.WHISPERX_ALIGN_MODELS
+    assert "kn" in asr_mod.WHISPERX_ALIGN_MODELS
+    assert asr_mod.whisperx_align_model_for_language("ta").endswith("tamil")
+    try:
+        asr_mod.whisperx_align_model_for_language("xx")
+        assert False, "expected AlignmentError"
+    except asr_mod.AlignmentError:
+        pass
 
 
 def test_transcribe_agent_words_conformer_mocked():
     mono = np.zeros(16000, dtype=np.float32)
-    with (
-        patch.object(asr_mod, "transcribe_indic_conformer", return_value="hello there") as tr,
-        patch.object(
-            asr_mod,
-            "align_words",
-            return_value=[("hello", (0.0, 0.4)), ("there", (0.4, 0.8))],
-        ) as al,
-    ):
-        words = asr_mod.transcribe_agent_words(
+    fake = asr_mod.AsrResult(
+        words=[("hello", (0.0, 0.4)), ("there", (0.4, 0.8))],
+        provenance=asr_mod.AsrProvenance(
+            transcript_backend="indic-conformer",
+            transcript_model="ai4bharat/fake",
+            timer_backend="whisperx",
+            timer_model="theainerd/Wav2Vec2-large-xlsr-hindi",
+            language="hi",
+            transcript_text="hello there",
+        ),
+    )
+    with patch.object(asr_mod, "transcribe_words_indic_conformer", return_value=fake) as tr:
+        result = asr_mod.transcribe_agent_words(
             mono, 16000, language="hi", backend="indic-conformer", device="cpu"
         )
     tr.assert_called_once()
-    al.assert_called_once()
-    assert words[0][0] == "hello"
-    assert words[1][1] == (0.4, 0.8)
+    assert result.words[0][0] == "hello"
+    assert result.provenance.timer_backend == "whisperx"
+    assert result.provenance.transcript_model == "ai4bharat/fake"
 
 
 def test_push_private_dataset_mocked(tmp_path: Path):

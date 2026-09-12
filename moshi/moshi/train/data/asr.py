@@ -3,9 +3,10 @@
 # LICENSE file in the root directory of this source tree.
 """Agent-channel ASR for Inner Monologue packer.
 
-Default path: IndicConformer (CTC) for transcript + forced alignment for word
-times. Whisper remains a fallback. Do **not** use NeMo Forced Aligner on
-IndicConformer checkpoints (tokenizer/vocab mismatch → bad timings).
+Strict path: IndicConformer (CTC) for transcript + **WhisperX** forced alignment
+for word times. No MMS / even-split fallbacks — missing aligner fails the clip.
+
+Do **not** use NeMo Forced Aligner on IndicConformer (tokenizer mismatch).
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import logging
 import re
 import tempfile
 import wave
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -24,9 +26,40 @@ ASR_SAMPLE_RATE = 16_000
 HINDI_CONFORMER = "ai4bharat/indicconformer_stt_hi_hybrid_ctc_rnnt_large"
 MULTI_CONFORMER = "ai4bharat/indic-conformer-600m-multilingual"
 
+# Explicit WhisperX wav2vec2 align models for our focus languages.
+WHISPERX_ALIGN_MODELS: dict[str, str] = {
+    "hi": "theainerd/Wav2Vec2-large-xlsr-hindi",
+    "te": "anuragshas/wav2vec2-large-xlsr-53-telugu",
+    "ta": "manandey/wav2vec2-large-xlsr-tamil",
+    "kn": "amoghsgopadi/wav2vec2-large-xlsr-kn",
+}
+
 WordSpan = tuple[str, tuple[float, float]]
 
 _conformer_cache: dict[str, object] = {}
+
+
+class AlignmentError(RuntimeError):
+    """Strict timing failed (WhisperX missing or align model failed)."""
+
+
+@dataclass
+class AsrProvenance:
+    transcript_backend: str
+    transcript_model: str
+    timer_backend: str
+    timer_model: str
+    language: str
+    transcript_text: str = ""
+
+
+@dataclass
+class AsrResult:
+    words: list[WordSpan]
+    provenance: AsrProvenance
+
+    def provenance_dict(self) -> dict:
+        return asdict(self.provenance)
 
 
 def resample_mono(x: np.ndarray, src_sr: int, dst_sr: int = ASR_SAMPLE_RATE) -> np.ndarray:
@@ -48,16 +81,6 @@ def split_words(text: str) -> list[str]:
     return [w for w in re.split(r"\s+", text.strip()) if w]
 
 
-def _even_word_spans(words: list[str], duration_sec: float) -> list[WordSpan]:
-    """Last-resort uniform split when forced alignment is unavailable."""
-    if not words:
-        return []
-    if duration_sec <= 0:
-        return [(w, (0.0, 0.0)) for w in words]
-    step = duration_sec / len(words)
-    return [(w, (i * step, (i + 1) * step)) for i, w in enumerate(words)]
-
-
 def conformer_repo_for_language(language: str) -> str:
     lang = (language or "hi").lower().replace("_", "-").split("-")[0]
     if lang in {"hi", "hin", "hindi"}:
@@ -67,9 +90,18 @@ def conformer_repo_for_language(language: str) -> str:
 
 def language_id_for_nemo(language: str) -> str:
     lang = (language or "hi").lower().replace("_", "-").split("-")[0]
-    # NeMo / AI4Bharat short codes
-    aliases = {"hin": "hi", "hindi": "hi", "tam": "ta", "tel": "te", "ben": "bn", "mar": "mr"}
+    aliases = {"hin": "hi", "hindi": "hi", "tam": "ta", "tel": "te", "ben": "bn", "mar": "mr", "kan": "kn"}
     return aliases.get(lang, lang)
+
+
+def whisperx_align_model_for_language(language: str) -> str:
+    lang = language_id_for_nemo(language)
+    if lang not in WHISPERX_ALIGN_MODELS:
+        raise AlignmentError(
+            f"No WhisperX align model mapped for language={lang!r}. "
+            f"Supported: {sorted(WHISPERX_ALIGN_MODELS)}"
+        )
+    return WHISPERX_ALIGN_MODELS[lang]
 
 
 def load_indic_conformer(repo: str, device: str = "cuda"):
@@ -79,7 +111,7 @@ def load_indic_conformer(repo: str, device: str = "cuda"):
     except ImportError as exc:
         raise ImportError(
             "IndicConformer needs nemo_toolkit[asr]. "
-            "Install: pip install 'nemo_toolkit[asr]' (or moshi[eval])."
+            "Install: pip install 'nemo_toolkit[asr]' (or moshi[eval/data])."
         ) from exc
 
     key = f"{repo}|{device}"
@@ -119,8 +151,8 @@ def transcribe_indic_conformer(
     *,
     device: str = "cuda",
     model_name: str | None = None,
-) -> str:
-    """Return plain transcript from IndicConformer CTC (agent channel)."""
+) -> tuple[str, str]:
+    """Return ``(transcript, model_repo)`` from IndicConformer CTC."""
     repo = model_name or conformer_repo_for_language(language)
     model = load_indic_conformer(repo, device=device)
     audio_16k = resample_mono(mono, sample_rate, ASR_SAMPLE_RATE)
@@ -129,7 +161,6 @@ def transcribe_indic_conformer(
 
     try:
         kwargs: dict = {"batch_size": 1}
-        # Multilingual checkpoint wants language_id; Hindi large often accepts it too.
         try:
             out = model.transcribe([path], language_id=lang_id, **kwargs)
         except TypeError:
@@ -137,8 +168,7 @@ def transcribe_indic_conformer(
     finally:
         Path(path).unlink(missing_ok=True)
 
-    text = _extract_transcript(out)
-    return text.strip()
+    return _extract_transcript(out).strip(), repo
 
 
 def _extract_transcript(out) -> str:
@@ -167,20 +197,31 @@ def align_words_whisperx(
     language: str,
     *,
     device: str = "cuda",
-) -> list[WordSpan] | None:
+) -> tuple[list[WordSpan], str]:
+    """Strict WhisperX align. Raises AlignmentError on failure."""
     try:
         import whisperx
-    except ImportError:
-        return None
+    except ImportError as exc:
+        raise AlignmentError(
+            "WhisperX is required for word timing. Install: pip install whisperx"
+        ) from exc
 
     words = split_words(transcript)
     if not words:
-        return []
+        return [], whisperx_align_model_for_language(language)
+
+    lang = language_id_for_nemo(language)
+    align_repo = whisperx_align_model_for_language(lang)
     audio = resample_mono(mono, sample_rate, ASR_SAMPLE_RATE)
     duration = float(len(audio) / ASR_SAMPLE_RATE)
     segments = [{"start": 0.0, "end": duration, "text": transcript}]
+
     try:
-        model_a, metadata = whisperx.load_align_model(language_code=language_id_for_nemo(language), device=device)
+        model_a, metadata = whisperx.load_align_model(
+            language_code=lang,
+            device=device,
+            model_name=align_repo,
+        )
         aligned = whisperx.align(
             segments,
             model_a,
@@ -189,9 +230,10 @@ def align_words_whisperx(
             device,
             return_char_alignments=False,
         )
-    except Exception:
-        logger.exception("WhisperX align failed; trying next aligner")
-        return None
+    except Exception as exc:
+        raise AlignmentError(
+            f"WhisperX align failed for language={lang} model={align_repo}: {exc}"
+        ) from exc
 
     out: list[WordSpan] = []
     for seg in aligned.get("segments", []) or []:
@@ -200,53 +242,11 @@ def align_words_whisperx(
             if not text or "start" not in w or "end" not in w:
                 continue
             out.append((text, (float(w["start"]), float(w["end"]))))
-    return out if out else None
-
-
-def align_words_mms(
-    mono: np.ndarray,
-    sample_rate: int,
-    transcript: str,
-    language: str,
-) -> list[WordSpan] | None:
-    """Torchaudio MMS forced aligner (supports Hindi among others)."""
-    try:
-        import torch
-        import torchaudio
-        from torchaudio.pipelines import MMS_FA as bundle
-    except ImportError:
-        return None
-
-    words = split_words(transcript)
-    if not words:
-        return []
-
-    try:
-        device = torch.device("cpu")
-        model = bundle.get_model()
-        model.to(device)
-        tokenizer = bundle.get_tokenizer()
-        aligner = bundle.get_aligner()
-        waveform = torch.from_numpy(resample_mono(mono, sample_rate, bundle.sample_rate)).unsqueeze(0)
-        with torch.inference_mode():
-            emission, _ = model(waveform.to(device))
-            token_spans = aligner(emission[0], tokenizer(words))
-    except Exception:
-        logger.exception("MMS forced align failed")
-        return None
-
-    num_frames = emission.size(1)
-    ratio = waveform.size(1) / num_frames
-    out: list[WordSpan] = []
-    for word, spans in zip(words, token_spans):
-        if not spans:
-            continue
-        start = float(spans[0].start * ratio / bundle.sample_rate)
-        end = float(spans[-1].end * ratio / bundle.sample_rate)
-        if end <= start:
-            end = start + 0.02
-        out.append((word, (start, end)))
-    return out if out else None
+    if not out:
+        raise AlignmentError(
+            f"WhisperX returned no word times (language={lang}, model={align_repo})"
+        )
+    return out, align_repo
 
 
 def align_words(
@@ -256,20 +256,9 @@ def align_words(
     language: str,
     *,
     device: str = "cuda",
-) -> list[WordSpan]:
-    words = split_words(transcript)
-    if not words:
-        return []
-    duration = float(len(resample_mono(mono, sample_rate)) / ASR_SAMPLE_RATE)
-    for fn in (
-        lambda: align_words_whisperx(mono, sample_rate, transcript, language, device=device),
-        lambda: align_words_mms(mono, sample_rate, transcript, language),
-    ):
-        spans = fn()
-        if spans:
-            return spans
-    logger.warning("No forced aligner available; using even word spans (install whisperx or torchaudio)")
-    return _even_word_spans(words, duration)
+) -> tuple[list[WordSpan], str]:
+    """Strict: WhisperX only."""
+    return align_words_whisperx(mono, sample_rate, transcript, language, device=device)
 
 
 def transcribe_words_indic_conformer(
@@ -279,13 +268,24 @@ def transcribe_words_indic_conformer(
     *,
     device: str = "cuda",
     model_name: str | None = None,
-) -> list[WordSpan]:
-    text = transcribe_indic_conformer(
+) -> AsrResult:
+    text, repo = transcribe_indic_conformer(
         mono, sample_rate, language, device=device, model_name=model_name
     )
     if not text.strip():
-        return []
-    return align_words(mono, sample_rate, text, language, device=device)
+        raise AlignmentError("IndicConformer returned empty transcript")
+    spans, align_repo = align_words(mono, sample_rate, text, language, device=device)
+    return AsrResult(
+        words=spans,
+        provenance=AsrProvenance(
+            transcript_backend="indic-conformer",
+            transcript_model=repo,
+            timer_backend="whisperx",
+            timer_model=align_repo,
+            language=language_id_for_nemo(language),
+            transcript_text=text,
+        ),
+    )
 
 
 def transcribe_words_whisper(
@@ -293,41 +293,52 @@ def transcribe_words_whisper(
     sample_rate: int,
     language: str,
     model_name: str = "large-v3",
-) -> list[WordSpan]:
-    """Word times via whisper-timestamped or openai-whisper."""
+) -> AsrResult:
+    """Whisper backend with its own word timestamps (timer = same Whisper model)."""
     audio = resample_mono(mono, sample_rate, ASR_SAMPLE_RATE)
+    timer_name = model_name
+    words: list[WordSpan] = []
     try:
         import whisper_timestamped as whisper_ts
 
         model = whisper_ts.load_model(model_name)
         out = whisper_ts.transcribe(model, audio, language=language, verbose=False)
-        words: list[WordSpan] = []
         for seg in out.get("segments", []):
             for word in seg.get("words", []):
                 text = str(word.get("text", "")).strip()
                 if not text:
                     continue
                 words.append((text, (float(word["start"]), float(word["end"]))))
-        return words
+        timer_name = f"whisper-timestamped/{model_name}"
     except ImportError:
-        pass
-    try:
-        import whisper
-    except ImportError as exc:
-        raise ImportError(
-            "Install whisper-timestamped or openai-whisper for --asr-backend whisper, "
-            "or use --asr-backend indic-conformer / --alignments-json / --dummy."
-        ) from exc
-    model = whisper.load_model(model_name)
-    result = model.transcribe(audio, language=language, word_timestamps=True, verbose=False)
-    words = []
-    for seg in result.get("segments", []):
-        for word in seg.get("words", []):
-            text = str(word.get("word", word.get("text", ""))).strip()
-            if not text:
-                continue
-            words.append((text, (float(word["start"]), float(word["end"]))))
-    return words
+        try:
+            import whisper
+        except ImportError as exc:
+            raise ImportError(
+                "Install whisper-timestamped or openai-whisper for --asr-backend whisper"
+            ) from exc
+        model = whisper.load_model(model_name)
+        result = model.transcribe(audio, language=language, word_timestamps=True, verbose=False)
+        for seg in result.get("segments", []):
+            for word in seg.get("words", []):
+                text = str(word.get("word", word.get("text", ""))).strip()
+                if not text:
+                    continue
+                words.append((text, (float(word["start"]), float(word["end"]))))
+        timer_name = f"openai-whisper/{model_name}"
+    if not words:
+        raise AlignmentError(f"Whisper returned no word times (model={timer_name})")
+    return AsrResult(
+        words=words,
+        provenance=AsrProvenance(
+            transcript_backend="whisper",
+            transcript_model=timer_name,
+            timer_backend="whisper",
+            timer_model=timer_name,
+            language=language_id_for_nemo(language),
+            transcript_text=" ".join(w for w, _ in words),
+        ),
+    )
 
 
 def transcribe_agent_words(
@@ -338,7 +349,7 @@ def transcribe_agent_words(
     backend: str = "indic-conformer",
     asr_model: str | None = None,
     device: str = "cuda",
-) -> list[WordSpan]:
+) -> AsrResult:
     """Dispatch ASR backend. ``backend``: indic-conformer | whisper."""
     backend = (backend or "indic-conformer").lower().replace("_", "-")
     if backend in {"indic-conformer", "indicconformer", "conformer"}:

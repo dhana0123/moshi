@@ -161,10 +161,11 @@ is the agent text stream plus 8+8 Mimi codebooks (see
 
 ```bash
 # dummy smoke
-python -m moshi.train.data.prepare --out ./data/moshi_im --dummy
-# IndicConformer + align (default), then private Hub upload
+python -m moshi.train.data.prepare --out ./data/moshi_im --dummy --no-push-to-hub
+# IndicConformer + align (default), private Hub upload is ON by default
 python -m moshi.train.data.prepare --out ./data/moshi_im \
-  --stereo-dir /path/to/wavs --language hi --push-to-hub
+  --stereo-dir /path/to/wavs --language hi
+# local only: add --no-push-to-hub
 ```
 
 Loading uses the same `CheckpointInfo` / `get_mimi` /

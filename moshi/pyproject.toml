@@ -60,6 +60,8 @@ data = [
     "torchaudio",
     "datasets",
     "soundfile",
+    "pyannote.audio >= 3.1",
+    "whisperx",
 ]
 eval = [
     "torchaudio",
