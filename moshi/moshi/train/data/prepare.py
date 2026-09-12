@@ -951,8 +951,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.stereo_dir:
         from .asr import AlignmentError
+        from .deps import require_data_deps
         from .diarize import DiarizationSkip
 
+        require_data_deps(diarize=args.diarize, asr_backend=args.asr_backend)
         if not args.alignments_json:
             warmup_models(
                 languages=[args.language or "hi"],
@@ -986,6 +988,9 @@ def main(argv: list[str] | None = None) -> int:
         langs = [
             asr_lang_for_indicvoices_config(c, args.language) for c in configs
         ]
+        from .deps import require_data_deps
+
+        require_data_deps(diarize=args.diarize, asr_backend=args.asr_backend)
         if not args.alignments_json:
             warmup_models(
                 languages=langs,

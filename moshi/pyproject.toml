@@ -54,14 +54,31 @@ dev = [
 train = [
     "pyyaml >= 6.0",
 ]
-# Dataset packer ASR (IndicConformer) + eval ASR share NeMo.
+# Dataset packer: IndicVoices → diarize → IndicConformer → WhisperX → HF push.
+# Install: pip install -e ".[data]"
 data = [
+    # Hub / I/O
+    "datasets>=2.19",
+    "huggingface-hub>=0.24",
+    "soundfile>=0.12",
+    "scipy>=1.11",
+    "pandas>=2.0",
+    # Diarization (mono → stereo)
+    "pyannote.audio>=3.1.0",
+    "lightning>=2.0",
+    "torchmetrics>=1.0",
+    # Agent ASR (IndicConformer CTC)
     "nemo_toolkit[asr]",
     "torchaudio",
-    "datasets",
-    "soundfile",
-    "pyannote.audio >= 3.1",
+    "omegaconf",
+    "hydra-core",
+    "lhotse",
+    # Word timing (strict WhisperX)
     "whisperx",
+    "transformers>=4.40",
+    "nltk",
+    # Optional Whisper backend
+    "openai-whisper",
 ]
 eval = [
     "torchaudio",

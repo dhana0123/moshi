@@ -1,0 +1,28 @@
+# Moshi Inner Monologue packer deps (same as pyproject [project.optional-dependencies].data)
+# From moshi/moshi:
+#   pip install -e ".[data]"
+#   # or:
+#   pip install -r requirements-data.txt
+#
+# Also accept gated HF model cards (same account as HF_TOKEN):
+#   https://huggingface.co/datasets/ai4bharat/IndicVoices
+#   https://huggingface.co/pyannote/speaker-diarization-3.1
+#   https://huggingface.co/pyannote/segmentation-3.0
+
+datasets>=2.19
+huggingface-hub>=0.24
+soundfile>=0.12
+scipy>=1.11
+pandas>=2.0
+pyannote.audio>=3.1.0
+lightning>=2.0
+torchmetrics>=1.0
+nemo_toolkit[asr]
+torchaudio
+omegaconf
+hydra-core
+lhotse
+whisperx
+transformers>=4.40
+nltk
+openai-whisper
