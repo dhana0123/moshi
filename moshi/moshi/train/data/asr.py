@@ -23,8 +23,28 @@ import numpy as np
 logger = logging.getLogger("moshi.prepare.asr")
 
 ASR_SAMPLE_RATE = 16_000
+# Per-language NeMo .nemo packs on HF (repo only contains *.nemo, not extracted yaml).
 HINDI_CONFORMER = "ai4bharat/indicconformer_stt_hi_hybrid_ctc_rnnt_large"
-MULTI_CONFORMER = "ai4bharat/indic-conformer-600m-multilingual"
+TE_CONFORMER = "ai4bharat/indicconformer_stt_te_hybrid_ctc_rnnt_large"
+TA_CONFORMER = "ai4bharat/indicconformer_stt_ta_hybrid_ctc_rnnt_large"
+KN_CONFORMER = "ai4bharat/indicconformer_stt_kn_hybrid_ctc_rnnt_large"
+# Legacy alias (old multilingual ONNX id was wrong for NeMo)
+MULTI_CONFORMER = TE_CONFORMER
+
+CONFORMER_REPO_BY_LANG: dict[str, str] = {
+    "hi": HINDI_CONFORMER,
+    "hin": HINDI_CONFORMER,
+    "hindi": HINDI_CONFORMER,
+    "te": TE_CONFORMER,
+    "tel": TE_CONFORMER,
+    "telugu": TE_CONFORMER,
+    "ta": TA_CONFORMER,
+    "tam": TA_CONFORMER,
+    "tamil": TA_CONFORMER,
+    "kn": KN_CONFORMER,
+    "kan": KN_CONFORMER,
+    "kannada": KN_CONFORMER,
+}
 
 # Explicit WhisperX wav2vec2 align models for our focus languages.
 WHISPERX_ALIGN_MODELS: dict[str, str] = {
@@ -83,9 +103,10 @@ def split_words(text: str) -> list[str]:
 
 def conformer_repo_for_language(language: str) -> str:
     lang = (language or "hi").lower().replace("_", "-").split("-")[0]
-    if lang in {"hi", "hin", "hindi"}:
-        return HINDI_CONFORMER
-    return MULTI_CONFORMER
+    if lang in CONFORMER_REPO_BY_LANG:
+        return CONFORMER_REPO_BY_LANG[lang]
+    logger.warning("No IndicConformer mapped for lang=%s; using Hindi model", lang)
+    return HINDI_CONFORMER
 
 
 def language_id_for_nemo(language: str) -> str:
@@ -104,6 +125,26 @@ def whisperx_align_model_for_language(language: str) -> str:
     return WHISPERX_ALIGN_MODELS[lang]
 
 
+def download_nemo_checkpoint(repo: str) -> Path:
+    """Download the ``*.nemo`` file from an AI4Bharat HF repo (not extracted yaml layout)."""
+    try:
+        from huggingface_hub import hf_hub_download, list_repo_files
+    except ImportError as exc:
+        raise ImportError("pip install huggingface_hub to download IndicConformer") from exc
+
+    files = list_repo_files(repo)
+    nemo_files = [f for f in files if f.endswith(".nemo")]
+    if not nemo_files:
+        raise FileNotFoundError(
+            f"No .nemo file in HF repo {repo!r}. Files: {files}. "
+            "IndicConformer packs ship as a single .nemo archive."
+        )
+    filename = sorted(nemo_files)[0]
+    logger.info("Downloading %s from %s …", filename, repo)
+    path = hf_hub_download(repo_id=repo, filename=filename)
+    return Path(path)
+
+
 def load_indic_conformer(repo: str, device: str = "cuda"):
     try:
         import nemo.collections.asr as nemo_asr
@@ -111,7 +152,7 @@ def load_indic_conformer(repo: str, device: str = "cuda"):
     except ImportError as exc:
         raise ImportError(
             "IndicConformer needs nemo_toolkit[asr]. "
-            "Install: pip install 'nemo_toolkit[asr]' (or moshi[eval/data])."
+            "Install: pip install 'nemo_toolkit[asr]' (or moshi[data])."
         ) from exc
 
     key = f"{repo}|{device}"
@@ -119,7 +160,19 @@ def load_indic_conformer(repo: str, device: str = "cuda"):
         return _conformer_cache[key]
 
     logger.info("Loading IndicConformer %s on %s …", repo, device)
-    model = nemo_asr.models.ASRModel.from_pretrained(repo)
+    # NeMo 3 from_pretrained expects model_config.yaml; AI4Bharat HF repos only
+    # ship a .nemo archive — download it and restore_from.
+    nemo_path = download_nemo_checkpoint(repo)
+    map_location = None
+    if device.startswith("cuda") and torch.cuda.is_available():
+        map_location = torch.device(device)
+    try:
+        model = nemo_asr.models.ASRModel.restore_from(
+            restore_path=str(nemo_path),
+            map_location=map_location,
+        )
+    except TypeError:
+        model = nemo_asr.models.ASRModel.restore_from(str(nemo_path))
     if hasattr(model, "cur_decoder"):
         model.cur_decoder = "ctc"
     model.freeze()
@@ -130,7 +183,7 @@ def load_indic_conformer(repo: str, device: str = "cuda"):
         model = model.cpu()
         device = "cpu"
     _conformer_cache[key] = model
-    logger.info("IndicConformer ready: %s", repo)
+    logger.info("IndicConformer ready: %s (%s)", repo, nemo_path.name)
     return model
 
 
